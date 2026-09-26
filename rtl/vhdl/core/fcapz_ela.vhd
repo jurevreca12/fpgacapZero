@@ -354,7 +354,11 @@ architecture rtl of fcapz_ela is
     signal start_ptr         : natural range 0 to DEPTH - 1 := 0;
     signal trig_ptr          : natural range 0 to DEPTH - 1 := 0;
     signal pre_count         : unsigned(PTR_W downto 0) := (others => '0');
-    signal post_count        : unsigned(PTR_W - 1 downto 0) := (others => '0');
+    -- LEN_W wide, like the Verilog core's: post_count is compared against
+    -- posttrig_len, which may legally hold DEPTH, so a PTR_W counter wraps
+    -- one short and the capture never completes.  (pre_count below is
+    -- already LEN_W wide, spelled PTR_W downto 0.)
+    signal post_count        : unsigned(LEN_W - 1 downto 0) := (others => '0');
     signal capture_len       : unsigned(PTR_W downto 0) := (others => '0');
     signal probe_prev        : std_logic_vector(SAMPLE_W - 1 downto 0) := (others => '0');
     signal decim_count       : unsigned(23 downto 0) := (others => '0');
@@ -467,6 +471,20 @@ architecture rtl of fcapz_ela is
     function count_u(v : unsigned) return unsigned is
     begin
         return resize(v, PTR_W + 1);
+    end function;
+
+    -- One bit wider than a length, for the overflow comparison only.  Mirrors
+    -- the Verilog core's config_capture_len, which is [LEN_W:0]: summing two
+    -- lengths and a 1 can carry out of LEN_W, and wrapping there would clear
+    -- the very overflow being tested for.
+    function len_sum_u(n : natural) return unsigned is
+    begin
+        return to_unsigned(n, LEN_W + 1);
+    end function;
+
+    function len_sum_u(v : unsigned) return unsigned is
+    begin
+        return resize(v, LEN_W + 1);
     end function;
 
     function sample_chunk_word(sample : std_logic_vector(SAMPLE_W - 1 downto 0); chunk : natural) return std_logic_vector is
@@ -1148,13 +1166,14 @@ begin
         datawin_oob_comb <= '0';
         datawin_mem_addr_comb <= (others => '0');
         datawin_chunk_comb <= 0;
-        -- Default the index out of range so the decode below is total.  An
-        -- address under ADDR_DATA_BASE assigns neither branch, and without this
-        -- the process variable would keep its value from the previous
-        -- invocation -- an inferred latch, and a divergence from
-        -- rtl/fcapz_ela.v, whose if/else is unconditional and whose 32-bit
-        -- subtract underflows to a far out-of-range index (so oob = 1,
-        -- mem_addr = 0).
+        -- Default the index OUT of range.  An address below ADDR_DATA_BASE
+        -- matches neither branch below, and the entry default of 0 is in range,
+        -- so such a read used to be treated as sample 0 of the window.  The
+        -- Verilog core's if/else is unconditional and its 32-bit subtract
+        -- underflows to a far out-of-range index, giving oob = 1 and
+        -- mem_addr = 0; this makes the VHDL agree.  Note the chunk index still
+        -- differs from the Verilog's underflowed value when
+        -- WORDS_PER_SAMPLE > 1; it is unused on an under-base read.
         sample_index := integer'high;
 
         if TIMESTAMP_W > 0 and addr >= ADDR_TS_DATA_BASE then
@@ -1574,7 +1593,8 @@ begin
                 armed <= '1';
                 triggered <= '0';
                 done <= '0';
-                overflow <= '1' when count_u(pretrig_len_sync2) + count_u(posttrig_len_sync2) + 1 > count_u(SEG_DEPTH) else '0';
+                overflow <= '1' when len_sum_u(pretrig_len_sync2) + len_sum_u(posttrig_len_sync2) + 1 >
+                                     len_sum_u(SEG_DEPTH) else '0';
                 if NUM_SEGMENTS > 1 then
                     wr_ptr <= 0;
                     pre_count <= (others => '0');

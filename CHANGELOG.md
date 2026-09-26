@@ -70,22 +70,27 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- **ELA (native VHDL) — an oversize capture length is reported, not silently
-  truncated.** `pretrig_len`, `posttrig_len` and their clock-crossing stages
-  were one bit narrower than the Verilog core's, which sizes them to hold a
-  length equal to `DEPTH`. A length written at or above `DEPTH` therefore
-  wrapped instead of raising `overflow`, so the core proceeded with a different
-  window as though the request were valid. No capture the host library can
-  request was affected — it validates `pretrigger + posttrigger + 1` against the
-  depth — so this only reached a JTAG master writing the registers directly,
-  which is exactly what the overflow flag exists to catch.
+- **ELA (native VHDL) — a capture length of `DEPTH` is reported, not silently
+  truncated, and still completes.** Three registers were a bit narrower than the
+  Verilog core's, which sizes them to hold a length equal to `DEPTH`:
+  `pretrig_len`/`posttrig_len` with their clock-crossing stages, `post_count`,
+  and the width the overflow comparison is evaluated at. So a length of `DEPTH`
+  wrapped instead of raising `overflow`; a `pretrigger`/`posttrigger` pair
+  summing above the length field cleared `overflow` outright; and a
+  `posttrigger` of `DEPTH` left `post_count` wrapping one short, so the capture
+  never completed at all. No capture the host library can request was affected
+  — it validates `pretrigger + posttrigger + 1` against the depth, and against
+  the segment depth for segmented builds — so this only reached a JTAG master
+  writing the registers directly, which is what the overflow flag exists to
+  catch. Lengths at or above the full field width wrap in both cores and are
+  unchanged.
 
-- **ELA (native VHDL) — the data-window address decode is now total.** Reading
-  any register below the sample-data window left the decode's sample index
-  holding its value from the previous evaluation, which both inferred a latch
-  and disagreed with the Verilog core (whose decode is unconditional and lands
-  out of range). Masked in practice, since the value is only consumed on a
-  data-window read.
+- **ELA (native VHDL) — the data-window address decode now defaults out of
+  range.** Reading any register below the sample-data window matched neither
+  branch of the decode and fell through to an in-range default of sample 0,
+  where the Verilog core lands far out of range and reports out-of-bounds.
+  Masked in practice, since the decoded value is only consumed on a data-window
+  read.
 
 - **ELA — captures no longer splice across a re-arm.** In single-segment builds
   the pre-trigger history rolls continuously, but sample writes stop while a

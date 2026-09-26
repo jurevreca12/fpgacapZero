@@ -74,6 +74,8 @@ class ElaFunctionalCoverage:
             "edge_trigger": 0,
             "overflow": 0,
             "oversize_length": 0,
+            "oversize_length_sum": 0,
+            "posttrigger_at_depth": 0,
             "decim_zero": 0,
             "decim_every4": 0,
             "decimation": 0,
@@ -379,13 +381,17 @@ async def overflow_and_reset(dut):
 
 @cocotb.test()
 async def oversize_length_is_reported_not_truncated(dut):
-    """A length of DEPTH or more must raise overflow, not wrap around.
+    """A length of DEPTH must raise overflow, not wrap around.
 
     The host rejects pre+post+1 > depth, so this is only reachable by a JTAG
     master writing the register directly -- which is exactly what the overflow
     flag is for.  DEPTH is the first value that needs more bits than a sample
     pointer, so a core that narrows the length to pointer width sees 0 here,
     computes a small capture_len and reports no overflow at all.
+
+    Scoped deliberately to DEPTH rather than "DEPTH or more": a value at or
+    above 2**LEN_W exceeds the length field in *both* cores and wraps in both,
+    so that is agreed behaviour rather than a defect.
     """
     ela = await setup(dut)
     await ela.reset_core()
@@ -406,6 +412,62 @@ async def oversize_length_is_reported_not_truncated(dut):
         f"pretrigger={DEPTH} with depth={DEPTH} must set overflow, got 0x{status:08x}"
     )
     FUNCTIONAL_COVERAGE.hit("oversize_length")
+
+
+@cocotb.test()
+async def oversize_length_sum_still_reports_overflow(dut):
+    """pre=DEPTH, post=DEPTH-1 overflows the *sum*, not just one field.
+
+    pre+post+1 is 2*DEPTH here, which needs one bit more than a length field
+    holds. A core that computes the overflow comparison at length width wraps
+    that sum to 0 and clears overflow -- reporting the request as fine. The
+    sibling test above uses post=0 and cannot catch this.
+    """
+    ela = await setup(dut)
+    await ela.reset_core()
+    await ela.write(ADDR_PRETRIG, DEPTH)
+    await ela.write(ADDR_POSTTRIG, DEPTH - 1)
+    await ela.arm()
+    status = 0
+    for _ in range(120):
+        await ela.wait_sample(1)
+        status = await ela.read(ADDR_STATUS)
+        if status & 0x8:
+            break
+    assert status & 0x8, (
+        f"pre={DEPTH} post={DEPTH - 1} (sum {2 * DEPTH}) must set overflow, "
+        f"got 0x{status:08x}"
+    )
+    FUNCTIONAL_COVERAGE.hit("oversize_length_sum")
+
+
+@cocotb.test()
+async def posttrigger_at_depth_still_completes(dut):
+    """A posttrigger of DEPTH must still terminate the capture.
+
+    post_count is compared against posttrig_len, so it needs the same width as
+    a length. One bit narrower and it wraps one short of DEPTH, so `done` never
+    asserts and the capture hangs rather than completing (overflowed).
+    """
+    ela = await setup(dut)
+    await ela.reset_core()
+    await ela.write(ADDR_PRETRIG, 0)
+    await ela.write(ADDR_POSTTRIG, DEPTH)
+    await ela.write(ADDR_TRIG_MODE, 1)
+    await ela.write(ADDR_TRIG_VALUE, 0)
+    await ela.write(ADDR_TRIG_MASK, 0)
+    await ela.arm()
+    await ela.drive_counter(4 * DEPTH + 16)
+    status = 0
+    for _ in range(4 * DEPTH + 120):
+        await ela.wait_sample(1)
+        status = await ela.read(ADDR_STATUS)
+        if status & 0x4:
+            break
+    assert status & 0x4, (
+        f"posttrigger={DEPTH} never completed, last status=0x{status:08x}"
+    )
+    FUNCTIONAL_COVERAGE.hit("posttrigger_at_depth")
 
 
 @cocotb.test()

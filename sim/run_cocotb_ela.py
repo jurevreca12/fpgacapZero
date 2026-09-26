@@ -73,6 +73,8 @@ TARGETS: tuple[CocotbTarget, ...] = (
             "edge_capture",
             "overflow_and_reset",
             "oversize_length_is_reported_not_truncated",
+            "oversize_length_sum_still_reports_overflow",
+            "posttrigger_at_depth_still_completes",
             "decimation_and_external_trigger",
             "decimation_zero_and_every4",
             "external_trigger_disabled",
