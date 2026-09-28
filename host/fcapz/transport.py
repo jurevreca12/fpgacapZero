@@ -676,11 +676,14 @@ class QuartusStpTransport(Transport):
 
     def close(self) -> None:
         proc = self._proc
-        self._proc = None
-        self._poisoned = True
         if proc is None:
+            self._poisoned = True
             self._join_drain_threads()
             return
+        # The teardown below runs BEFORE the session is marked closed: _send
+        # refuses to talk to a poisoned transport, so poisoning first would
+        # silently skip close_device and leave the cable to be freed by
+        # process exit alone.
         if proc.stdin:
             try:
                 # Let Quartus release the cable through its own teardown.
@@ -703,6 +706,8 @@ class QuartusStpTransport(Transport):
                 proc.stdin.close()
             except Exception:
                 _quartus_log.debug("quartus_stp stdin close failed", exc_info=True)
+        self._proc = None
+        self._poisoned = True
         self._wait_for_exit(proc)
         self._join_drain_threads()
         self._close_pipes(proc)

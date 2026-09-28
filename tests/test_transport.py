@@ -915,6 +915,42 @@ class QuartusStpTransportTests(unittest.TestCase):
         self.assertIsNone(t._proc)
         t.close()  # idempotent, per the Transport contract
 
+    def test_quartus_close_actually_sends_close_device(self):
+        """close() must run Quartus' own teardown, not just kill the process.
+
+        _send refuses to talk to a poisoned transport, so marking the session
+        closed before the teardown silently skips close_device and leaves the
+        cable to be freed by process exit alone -- with the failure swallowed
+        by close()'s own except.
+        """
+        sent = []
+
+        class Spy(QuartusStpTransport):
+            def _send(self, script, **kwargs):
+                try:
+                    out = super()._send(script, **kwargs)
+                except Exception as exc:
+                    sent.append((type(exc).__name__, script))
+                    raise
+                sent.append(("OK", script))
+                return out
+
+        t = Spy(
+            quartus_stp_argv=[
+                sys.executable,
+                str(ROOT / "tests" / "fixtures" / "fake_quartus_stp.py"),
+                "-s",
+            ],
+            read_timeout_sec=5.0,
+        )
+        t.connect()
+        t.close()
+        teardown = [(kind, s) for kind, s in sent if "close_device" in s]
+        self.assertEqual(len(teardown), 1, f"close_device not attempted: {sent}")
+        self.assertEqual(
+            teardown[0][0], "OK", f"close_device was attempted but failed: {teardown}"
+        )
+
     def test_quartus_close_kills_a_process_that_ignores_exit(self):
         t = self._fake_quartus("fake_quartus_stp_stubborn.py")
         t.CLOSE_GRACE_SEC = 0.3
