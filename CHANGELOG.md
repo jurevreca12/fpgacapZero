@@ -70,20 +70,24 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- **ELA (native VHDL) — a capture length of `DEPTH` is reported, not silently
-  truncated, and still completes.** Three registers were a bit narrower than the
-  Verilog core's, which sizes them to hold a length equal to `DEPTH`:
-  `pretrig_len`/`posttrig_len` with their clock-crossing stages, `post_count`,
-  and the width the overflow comparison is evaluated at. So a length of `DEPTH`
-  wrapped instead of raising `overflow`; a `pretrigger`/`posttrigger` pair
-  summing above the length field cleared `overflow` outright; and a
-  `posttrigger` of `DEPTH` left `post_count` wrapping one short, so the capture
-  never completed at all. No capture the host library can request was affected
-  — it validates `pretrigger + posttrigger + 1` against the depth, and against
-  the segment depth for segmented builds — so this only reached a JTAG master
-  writing the registers directly, which is what the overflow flag exists to
-  catch. Lengths at or above the full field width wrap in both cores and are
-  unchanged.
+- **ELA (native VHDL) — a capture length of `DEPTH` is no longer silently
+  truncated.** The VHDL core sized `pretrig_len`/`posttrig_len` and their
+  clock-crossing stages one bit narrower than the Verilog core, which sizes them
+  to hold a length equal to `DEPTH`. It kept only the low `PTR_W` bits of a
+  written length where the Verilog keeps one more, so any length with that bit
+  set was misread — a length of `DEPTH`, for instance, as 0. An oversize request
+  was accepted without raising `overflow`, and a `posttrigger` of `DEPTH`
+  returned a capture with no post-trigger samples. Two more widths had to move
+  with it — `post_count`, and the width the overflow comparison is evaluated at.
+  Widening the lengths alone would otherwise have made a `posttrigger` of
+  `DEPTH` never complete, and let a `pretrigger`/`posttrigger` pair summing to
+  `2×DEPTH` wrap and clear `overflow`.
+  No capture the host library can request was affected — it validates
+  `pretrigger + posttrigger + 1` against the depth, and against the segment
+  depth for segmented builds — so this only reached a JTAG master writing the
+  registers directly, which is what the overflow flag exists to catch. Values
+  too wide even for the Verilog's field still wrap, now identically in both
+  cores.
 
 - **ELA (native VHDL) — the data-window address decode now defaults out of
   range.** Reading any register below the sample-data window matched neither
