@@ -16,7 +16,7 @@ import subprocess
 import threading
 from abc import ABC, abstractmethod
 
-from typing import List
+from typing import IO, List
 
 # Character whitelist for the JTAG target filter (XSDB `jtag targets -set
 # -filter {name =~ "..."}`).  This value is interpolated inside a
@@ -576,6 +576,13 @@ class QuartusStpTransport(Transport):
     # virtual IR value is currently fixed at zero.
     VIRTUAL_IR_VALUE = 0
     _SENTINEL = "<<FCAPZ_QUARTUS_STP_DONE>>"
+    # close() teardown budget.  The healthy path costs none of it -
+    # quartus_stp exits promptly on stdin EOF - and only a wedged process
+    # pays, in this order: wait, terminate, kill.
+    CLOSE_GRACE_SEC = 5.0
+    CLOSE_TERM_SEC = 2.0
+    CLOSE_KILL_SEC = 2.0
+    CLOSE_JOIN_SEC = 1.0
 
     def __init__(
         self,
@@ -626,7 +633,7 @@ class QuartusStpTransport(Transport):
                 )
             argv = [quartus_stp, "-s"]
 
-        self._proc = subprocess.Popen(
+        proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -634,31 +641,55 @@ class QuartusStpTransport(Transport):
             text=True,
             bufsize=1,
         )
+        self._proc = proc
         self._poisoned = False
         self._has_burst = True
         self._stdout_lines = queue.Queue()
         self._stderr_lines = []
-        if self._proc.poll() is not None:
-            self._raise_process_exited()
-        self._stderr_thread = threading.Thread(
-            target=self._drain_stderr, daemon=True
-        )
-        self._stderr_thread.start()
-        self._stdout_thread = threading.Thread(
-            target=self._drain_stdout, daemon=True
-        )
-        self._stdout_thread.start()
-        if self._proc.poll() is not None:
-            self._raise_process_exited()
-        opened_device = self._send(self._open_device_script())
+        try:
+            if proc.poll() is not None:
+                self._raise_process_exited()
+            self._stderr_thread = threading.Thread(
+                target=self._drain_stderr,
+                args=(proc.stderr, self._stderr_lines),
+                daemon=True,
+            )
+            self._stderr_thread.start()
+            self._stdout_thread = threading.Thread(
+                target=self._drain_stdout,
+                args=(proc.stdout, self._stdout_lines),
+                daemon=True,
+            )
+            self._stdout_thread.start()
+            if proc.poll() is not None:
+                self._raise_process_exited()
+            opened_device = self._send(self._open_device_script())
+        except BaseException:
+            # A failure here (cable busy, no such device) would otherwise
+            # leave quartus_stp running and still holding the USB-Blaster,
+            # so the next attempt fails for a reason that has nothing to do
+            # with the original one.
+            self.close()
+            raise
         self.opened_device = self._prettify_device_name(opened_device)
         _quartus_log.info("Opened Quartus JTAG device %s", opened_device)
 
     def close(self) -> None:
         proc = self._proc
-        if proc and proc.stdin:
+        self._proc = None
+        self._poisoned = True
+        if proc is None:
+            self._join_drain_threads()
+            return
+        if proc.stdin:
             try:
-                self._send("catch {close_device}")
+                # Let Quartus release the cable through its own teardown.
+                # Bounded well under read_timeout_sec: a wedged session must
+                # not make closing take a minute.
+                self._send(
+                    "catch {close_device}",
+                    timeout=min(self.CLOSE_GRACE_SEC, self.read_timeout_sec),
+                )
             except Exception:
                 _quartus_log.debug("quartus_stp close_device failed", exc_info=True)
             try:
@@ -666,13 +697,85 @@ class QuartusStpTransport(Transport):
                 proc.stdin.flush()
             except Exception:
                 _quartus_log.debug("quartus_stp exit write failed", exc_info=True)
-        if proc:
             try:
-                proc.terminate()
+                # EOF makes quartus_stp -s exit even if the 'exit' line was
+                # never parsed.
+                proc.stdin.close()
             except Exception:
-                _quartus_log.debug("quartus_stp terminate failed", exc_info=True)
+                _quartus_log.debug("quartus_stp stdin close failed", exc_info=True)
+        self._wait_for_exit(proc)
+        self._join_drain_threads()
+        self._close_pipes(proc)
+
+    def close_fast(self) -> None:
+        """Kill ``quartus_stp`` without the graceful wait, for Ctrl+C.
+
+        Skips Quartus' own ``close_device``, so the cable is released by
+        process exit alone; :meth:`close` is the orderly path.
+        """
+        proc = self._proc
         self._proc = None
         self._poisoned = True
+        if proc is None:
+            self._join_drain_threads()
+            return
+        try:
+            proc.kill()
+        except Exception:
+            _quartus_log.debug("quartus_stp kill failed", exc_info=True)
+        try:
+            proc.wait(timeout=self.CLOSE_KILL_SEC)
+        except subprocess.TimeoutExpired:
+            _quartus_log.debug("quartus_stp did not die on kill")
+        self._join_drain_threads()
+        self._close_pipes(proc)
+
+    def _wait_for_exit(self, proc: subprocess.Popen) -> None:
+        """Block until *proc* is really gone, escalating if it will not go.
+
+        Returning while quartus_stp is still alive leaves the USB-Blaster
+        claimed, so a script that closes one connection and opens another
+        races its own previous process for the cable.
+        """
+        for timeout, signal in (
+            (self.CLOSE_GRACE_SEC, None),
+            (self.CLOSE_TERM_SEC, proc.terminate),
+            (self.CLOSE_KILL_SEC, proc.kill),
+        ):
+            if signal is not None:
+                try:
+                    signal()
+                except Exception:
+                    _quartus_log.debug(
+                        "quartus_stp signal failed", exc_info=True
+                    )
+            try:
+                proc.wait(timeout=timeout)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+        _quartus_log.warning(
+            "quartus_stp (pid %s) would not exit; the USB-Blaster may stay "
+            "claimed until it does",
+            proc.pid,
+        )
+
+    def _join_drain_threads(self) -> None:
+        for attr in ("_stdout_thread", "_stderr_thread"):
+            thread = getattr(self, attr)
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=self.CLOSE_JOIN_SEC)
+            setattr(self, attr, None)
+
+    @staticmethod
+    def _close_pipes(proc: subprocess.Popen) -> None:
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is None:
+                continue
+            try:
+                pipe.close()
+            except Exception:
+                _quartus_log.debug("quartus_stp pipe close failed", exc_info=True)
 
     def select_chain(self, chain: int) -> None:
         if chain < 1:
@@ -1176,7 +1279,7 @@ class QuartusStpTransport(Transport):
         lines.append("set __fcapz_device")
         return "\n".join(lines)
 
-    def _send(self, script: str) -> str:
+    def _send(self, script: str, *, timeout: float | None = None) -> str:
         if self._poisoned:
             raise RuntimeError("quartus_stp transport is closed or timed out; reconnect")
         if not self._proc or not self._proc.stdin or not self._proc.stdout:
@@ -1197,6 +1300,9 @@ class QuartusStpTransport(Transport):
                 "flush stdout",
             ]
         )
+        # close() needs a teardown command that cannot hang for the full
+        # read timeout, so the wait is overridable per call.
+        wait_sec = self.read_timeout_sec if timeout is None else float(timeout)
         with self._stp_io_lock:
             if self._proc.poll() is not None:
                 self._raise_process_exited()
@@ -1205,12 +1311,12 @@ class QuartusStpTransport(Transport):
             lines: list[str] = []
             while True:
                 try:
-                    raw = self._stdout_lines.get(timeout=self.read_timeout_sec)
+                    raw = self._stdout_lines.get(timeout=wait_sec)
                 except queue.Empty as exc:
                     self._poison_after_timeout()
                     raise TimeoutError(
                         "timed out waiting for quartus_stp response sentinel "
-                        f"after {self.read_timeout_sec:.1f}s; reconnect required"
+                        f"after {wait_sec:.1f}s; reconnect required"
                     ) from exc
                 if raw is None:
                     stderr = "\n".join(self._stderr_lines[-20:])
@@ -1288,18 +1394,20 @@ class QuartusStpTransport(Transport):
             f"quartus_stp exited with status {code}. stderr:\n{stderr}"
         )
 
-    def _drain_stderr(self) -> None:
-        if not self._proc or not self._proc.stderr:
-            raise RuntimeError("quartus_stp process not initialized")
-        for raw in self._proc.stderr:
-            self._stderr_lines.append(raw.rstrip("\n\r"))
+    def _drain_stderr(self, stderr: IO[str], sink: list[str]) -> None:
+        # Bound at thread creation, for the reason given on _drain_stdout.
+        for raw in stderr:
+            sink.append(raw.rstrip("\n\r"))
 
-    def _drain_stdout(self) -> None:
-        if not self._proc or not self._proc.stdout:
-            raise RuntimeError("quartus_stp process not initialized")
-        for raw in self._proc.stdout:
-            self._stdout_lines.put(raw)
-        self._stdout_lines.put(None)
+    def _drain_stdout(self, stdout: IO[str], sink: "queue.Queue[str | None]") -> None:
+        # The stream and the sink are arguments, never read off self.
+        # connect() installs a fresh queue, so a drain thread still
+        # finishing with the previous process would otherwise deliver its
+        # EOF marker into the new connection's queue, and the first scan
+        # after a reconnect would fail with 'process exited unexpectedly'.
+        for raw in stdout:
+            sink.put(raw)
+        sink.put(None)
 
     @staticmethod
     def _int_to_shift_string(value: int, width: int) -> str:

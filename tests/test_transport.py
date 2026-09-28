@@ -9,7 +9,10 @@ hardware or network connection required.
 
 from __future__ import annotations
 
+import io
+import queue
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -889,6 +892,99 @@ class QuartusStpTransportTests(unittest.TestCase):
             self.assertEqual(t.raw_dr_scan_batch([(0x11, 49), (0x22, 49)]), [0x11, 0x22])
         finally:
             t.close()
+
+    # -- close() must not return while quartus_stp still holds the cable -----
+
+    @staticmethod
+    def _fake_quartus(name="fake_quartus_stp.py", **kwargs):
+        return QuartusStpTransport(
+            quartus_stp_argv=[sys.executable, str(ROOT / "tests" / "fixtures" / name), "-s"],
+            read_timeout_sec=5.0,
+            **kwargs,
+        )
+
+    def test_quartus_close_waits_for_the_process_to_exit(self):
+        """A second connection cannot open the USB-Blaster while the first
+        quartus_stp is alive, so close() must not return before it is gone."""
+        t = self._fake_quartus()
+        t.connect()
+        proc = t._proc
+        self.assertIsNotNone(proc)
+        t.close()
+        self.assertIsNotNone(proc.poll(), "close() returned with quartus_stp still running")
+        self.assertIsNone(t._proc)
+        t.close()  # idempotent, per the Transport contract
+
+    def test_quartus_close_kills_a_process_that_ignores_exit(self):
+        t = self._fake_quartus("fake_quartus_stp_stubborn.py")
+        t.CLOSE_GRACE_SEC = 0.3
+        t.CLOSE_TERM_SEC = 0.3
+        t.CLOSE_KILL_SEC = 2.0
+        t.connect()
+        proc = t._proc
+        t.close()
+        self.assertIsNotNone(proc.poll(), "close() left an unkillable quartus_stp running")
+
+    def test_quartus_close_then_connect_starts_a_clean_session(self):
+        """The reconnect path a script takes when it opens a second session."""
+        t = self._fake_quartus()
+        t.connect()
+        first = t._proc
+        t.close()
+        t.connect()
+        try:
+            self.assertIsNot(t._proc, first)
+            self.assertEqual(t.read_reg(0x20), 0x12345678)
+        finally:
+            t.close()
+
+    def test_quartus_drain_thread_writes_to_its_own_queue(self):
+        """The EOF marker must land in the queue the thread was started with.
+
+        connect() installs a fresh queue for each session.  A drain thread that
+        looked the queue up on self at put-time would deliver the *previous*
+        process's end-of-stream into the *new* session and make its first scan
+        fail with "process exited unexpectedly"."""
+        t = QuartusStpTransport()
+        old_queue = queue.Queue()
+        stream = io.StringIO("one\ntwo\n")
+        t._stdout_lines = old_queue
+        thread = threading.Thread(
+            target=t._drain_stdout, args=(stream, old_queue), daemon=True
+        )
+        thread.start()
+        new_queue = queue.Queue()
+        t._stdout_lines = new_queue  # what connect() does
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        drained = []
+        while not old_queue.empty():
+            drained.append(old_queue.get_nowait())
+        self.assertEqual(drained, ["one\n", "two\n", None])
+        self.assertTrue(new_queue.empty(), "EOF marker leaked into the new session")
+
+    def test_quartus_connect_failure_does_not_orphan_the_process(self):
+        """A failed open must not leave quartus_stp holding the cable."""
+        leaked = []
+
+        class FailingOpen(QuartusStpTransport):
+            def _open_device_script(self):
+                leaked.append(self._proc)
+                raise RuntimeError("cable busy")
+
+        t = FailingOpen(
+            quartus_stp_argv=[
+                sys.executable,
+                str(ROOT / "tests" / "fixtures" / "fake_quartus_stp.py"),
+                "-s",
+            ],
+            read_timeout_sec=5.0,
+        )
+        with self.assertRaises(RuntimeError):
+            t.connect()
+        self.assertIsNone(t._proc)
+        self.assertEqual(len(leaked), 1)
+        self.assertIsNotNone(leaked[0].poll(), "connect() failure orphaned quartus_stp")
 
 
 # ---------------------------------------------------------------------------

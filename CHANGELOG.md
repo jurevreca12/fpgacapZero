@@ -9,6 +9,30 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Intel/Altera — a closed USB-Blaster session no longer blocks the next one.**
+  `QuartusStpTransport.close()` signalled `quartus_stp` to exit and returned
+  immediately, without waiting for it to do so. The process was therefore often
+  still alive — still holding the cable — when the caller opened the next
+  connection, so a script that closed one session before starting another could
+  fail to open the USB-Blaster. `close()` now closes the process's stdin and
+  waits for it to exit, escalating to terminate and kill if it will not, so it
+  cannot return while the cable is still claimed. The healthy path is unchanged
+  in speed. A new `close_fast()` skips the wait for Ctrl+C, matching the Xilinx
+  transport.
+
+- **Intel/Altera — a reconnect could fail with "process exited unexpectedly".**
+  The `quartus_stp` output-draining threads looked their destination queue up on
+  the transport at delivery time rather than being bound to it, so a thread still
+  finishing with a closed session could deliver that session's end-of-stream
+  marker into the *next* connection's queue and fail its first register scan.
+  The threads are now bound to the stream and queue they were started with, and
+  `close()` joins them.
+
+- **Intel/Altera — a failed connect no longer leaves `quartus_stp` running.**
+  If opening the device failed (cable busy, no such device), the process stayed
+  alive holding the cable, so the following attempt failed for an unrelated
+  reason. `connect()` now tears it down before re-raising.
+
 - **`--program` silently programmed nothing on Zynq UltraScale+ MPSoC.** The
   configuration target was selected out of xsdb's `targets` tree by the part
   name (`xck26`), but on MPSoC that tree has no node named for the part — it is
