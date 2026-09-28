@@ -9,7 +9,12 @@ hardware or network connection required.
 
 from __future__ import annotations
 
+import os
+import queue
+import signal
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -1213,6 +1218,90 @@ class QuartusStpTransportTests(unittest.TestCase):
         self.assertFalse(first.is_alive() or second.is_alive(), "a close() never returned")
         self.assertIsNotNone(proc.poll(), "quartus_stp survived two closes")
         self.assertIsNone(t._proc)
+
+    def test_quartus_close_returns_while_a_child_holds_the_output_pipes(self):
+        """If quartus_stp leaves a child holding its stdout/stderr, the drain
+        threads never see EOF.  Closing a pipe one of them is still reading
+        blocks, so close() must leave that pipe open rather than hang."""
+        pid_file = Path(tempfile.mkdtemp()) / "child.pid"
+        t = QuartusStpTransport(
+            quartus_stp_argv=[
+                sys.executable,
+                str(ROOT / "tests" / "fixtures" / "fake_quartus_stp_spawner.py"),
+                str(pid_file),
+            ],
+            read_timeout_sec=5.0,
+        )
+        t.CLOSE_JOIN_SEC = 0.2
+        t.connect()
+        child = int(pid_file.read_text())
+        self.addCleanup(os.kill, child, signal.SIGTERM)
+        proc = t._proc
+        closer = threading.Thread(target=t.close, daemon=True)
+        closer.start()
+        closer.join(timeout=10)
+        self.assertFalse(closer.is_alive(), "close() blocked on a pipe still being read")
+        self.assertIsNotNone(proc.poll())
+        self.assertIsNone(t._proc)
+
+    def test_quartus_failed_drain_thread_start_does_not_leak_the_process(self):
+        """The session is not published until its threads run, so a failure
+        starting them must reap the process itself: no close() can find it."""
+        real_start = threading.Thread.start
+        real_popen = subprocess.Popen
+        starts = []
+        spawned = []
+
+        def flaky_start(thread):
+            starts.append(thread)
+            if len(starts) == 2:
+                raise RuntimeError("can't start new thread")
+            real_start(thread)
+
+        def recording_popen(*args, **kwargs):
+            spawned.append(real_popen(*args, **kwargs))
+            return spawned[-1]
+
+        t = self._fake_quartus("fake_quartus_stp_stubborn.py")
+        with patch.object(threading.Thread, "start", flaky_start), patch.object(
+            subprocess, "Popen", recording_popen
+        ):
+            with self.assertRaisesRegex(RuntimeError, "can't start new thread"):
+                t.connect()
+        self.assertEqual(len(spawned), 1)
+        self.addCleanup(spawned[0].kill)
+        self.assertIsNotNone(spawned[0].poll(), "the unpublished quartus_stp is still running")
+        self.assertIsNone(t._proc)
+
+    def test_quartus_interrupted_request_leaves_no_answer_for_the_next(self):
+        """A request interrupted after sending (Ctrl+C) may still get its
+        answer.  The next request must refuse the session, not read it."""
+
+        class Interrupting:
+            def __init__(self):
+                self.q = queue.Queue()
+                self.interrupted = False
+
+            def put(self, item):
+                self.q.put(item)
+
+            def get(self, timeout=None):
+                if not self.interrupted:
+                    self.interrupted = True
+                    raise KeyboardInterrupt
+                return self.q.get(timeout=timeout)
+
+        proc = MagicMock()
+        proc.poll.return_value = None
+        t = QuartusStpTransport(read_timeout_sec=1.0)
+        out = Interrupting()
+        _install_session(t, proc, out=out)
+        with self.assertRaises(KeyboardInterrupt):
+            t._send("puts A")
+        out.put(f"tcl> {0x11111111:049b}\n")  # A's answer, arriving late
+        out.put(f"tcl> {QuartusStpTransport._SENTINEL}\n")
+        with self.assertRaisesRegex(RuntimeError, "reconnect"):
+            t._send("puts B")
 
     def test_quartus_request_during_reconnect_sees_one_whole_session(self):
         """A request that arrives the instant a reconnect makes its session

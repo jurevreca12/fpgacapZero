@@ -679,16 +679,21 @@ class QuartusStpTransport(Transport):
                 bufsize=1,
             )
             session = _StpSession(proc)
-            session.threads = (
-                threading.Thread(
-                    target=self._drain_stdout, args=(proc.stdout, session.out), daemon=True
-                ),
-                threading.Thread(
-                    target=self._drain_stderr, args=(proc.stderr, session.err), daemon=True
-                ),
-            )
-            for thread in session.threads:
-                thread.start()
+            try:
+                session.threads = (
+                    threading.Thread(
+                        target=self._drain_stdout, args=(proc.stdout, session.out), daemon=True
+                    ),
+                    threading.Thread(
+                        target=self._drain_stderr, args=(proc.stderr, session.err), daemon=True
+                    ),
+                )
+                for thread in session.threads:
+                    thread.start()
+            except BaseException:
+                # Not published yet, so no close() could ever find it.
+                self._reap_killed(session)
+                raise
             self._has_burst = True
             # Published before the open handshake, so a close() from another
             # thread (a GUI cancel) has a process to kill while it runs.
@@ -796,7 +801,7 @@ class QuartusStpTransport(Transport):
                     self._stp_io_lock.release()
         self._wait_for_exit(proc, self._remaining(deadline))
         self._join_threads(session.threads)
-        self._close_pipes(proc)
+        self._close_pipes(session)
 
     def _retire_session(self, session: _StpSession) -> None:
         """Kill and reap *session*, whose request timed out.
@@ -875,22 +880,48 @@ class QuartusStpTransport(Transport):
                 proc.pid,
             )
         self._join_threads(session.threads)
-        self._close_pipes(proc)
+        self._close_pipes(session)
 
     def _join_threads(self, threads: tuple[threading.Thread, ...]) -> None:
         for thread in threads:
             if thread is not threading.current_thread() and thread.is_alive():
                 thread.join(timeout=self.CLOSE_JOIN_SEC)
 
-    @staticmethod
-    def _close_pipes(proc: subprocess.Popen) -> None:
-        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+    def _close_pipes(self, session: _StpSession) -> None:
+        """Close *session*'s pipes, skipping any that could block.
+
+        Closing a pipe waits for whichever thread is using it.  A drain thread
+        can still be reading after quartus_stp exits if a process it started
+        inherited the write end, and this runs under ``_life_lock``, so an
+        output pipe is closed only once its drain thread has finished, and
+        stdin only if no request holds the I/O lock.  A skipped pipe is left
+        to garbage collection.
+        """
+        proc = session.proc
+        readers = dict(zip((id(proc.stdout), id(proc.stderr)), session.threads))
+        for pipe in (proc.stdout, proc.stderr):
             if pipe is None:
                 continue
-            try:
-                pipe.close()
-            except Exception:
-                _quartus_log.debug("quartus_stp pipe close failed", exc_info=True)
+            reader = readers.get(id(pipe))
+            if reader is not None and reader.is_alive():
+                _quartus_log.debug(
+                    "quartus_stp output pipe still being read; left open (pid %s)", proc.pid
+                )
+                continue
+            self._close_quietly(pipe)
+        if proc.stdin is not None:
+            if self._stp_io_lock.acquire(blocking=False):
+                try:
+                    self._close_quietly(proc.stdin)
+                finally:
+                    self._stp_io_lock.release()
+
+    @staticmethod
+    def _close_quietly(pipe: IO[str]) -> None:
+        try:
+            pipe.close()
+        except Exception:
+            _quartus_log.debug("quartus_stp pipe close failed", exc_info=True)
 
     def select_chain(self, chain: int) -> None:
         if chain < 1:
@@ -1444,6 +1475,7 @@ class QuartusStpTransport(Transport):
                 f"quartus_stp is busy with another request; not sent within {timeout:.1f}s"
             )
         waited: float | None = None
+        answered = False
         try:
             # Checked again under the lock: a request that timed out on this
             # session marks it dead before releasing the lock, and its late
@@ -1465,13 +1497,11 @@ class QuartusStpTransport(Transport):
                     wait_sec = self._remaining(deadline)
                     if wait_sec <= 0.0:
                         waited = float(timeout)
-                        session.dead = True
                         break
                 try:
                     raw = session.out.get(timeout=wait_sec)
                 except queue.Empty:
                     waited = self.read_timeout_sec if deadline is None else float(timeout)
-                    session.dead = True  # before the lock is released
                     break
                 if raw is None:
                     stderr = "\n".join(session.err[-20:])
@@ -1480,10 +1510,17 @@ class QuartusStpTransport(Transport):
                     )
                 line = self._strip_quartus_prompt(raw.rstrip("\n\r"))
                 if line.strip() == self._SENTINEL:
+                    answered = True
                     break
                 if line:
                     lines.append(line)
         finally:
+            if not answered:
+                # Timed out, interrupted (Ctrl+C) or failed after the script
+                # may have been sent: its answer can still arrive, and the
+                # next request would read it as its own.  Marked before the
+                # lock is released, so that request cannot get in first.
+                session.dead = True
             self._stp_io_lock.release()
         if waited is not None:
             # Outside the I/O lock: retiring takes _life_lock, and connect()

@@ -34,8 +34,8 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   "process exited unexpectedly". A request arriving just after another timed
   out could also read that request's late answer as its own. Each session is
   now one object, built completely before it is published, and every request
-  stays bound to the session it started on; a timeout marks that session dead
-  before the next request can reach it. `connect()` on a transport that is
+  stays bound to the session it started on; a timeout or interruption marks
+  that session dead before the next request can reach it. `connect()` on a transport that is
   still open closes the previous session instead of leaking its process, and a
   failed `connect()` no longer leaves `quartus_stp` running. A timed-out
   session is now reaped — waited for and its pipes closed — rather than only
