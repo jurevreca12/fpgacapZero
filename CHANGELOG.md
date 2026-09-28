@@ -31,12 +31,16 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   stale request could destroy the connection that had replaced its own; the
   output-draining threads could likewise deliver a closed session's
   end-of-stream marker into the next session and fail its first scan with
-  "process exited unexpectedly". Each request and each drain thread now stays
-  bound to the session it started on. `connect()` on a transport that is still
-  open closes the previous session instead of leaking its process, and a
+  "process exited unexpectedly". A request arriving just after another timed
+  out could also read that request's late answer as its own. Each session is
+  now one object, built completely before it is published, and every request
+  stays bound to the session it started on; a timeout marks that session dead
+  before the next request can reach it. `connect()` on a transport that is
+  still open closes the previous session instead of leaking its process, and a
   failed `connect()` no longer leaves `quartus_stp` running. A timed-out
   session is now reaped — waited for and its pipes closed — rather than only
-  signalled.
+  signalled. Cancelling a connect from the GUI no longer waits for an
+  `open_device` that keeps printing without finishing: `close()` kills it.
 
 - **`--program` silently programmed nothing on Zynq UltraScale+ MPSoC.** The
   configuration target was selected out of xsdb's `targets` tree by the part

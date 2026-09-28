@@ -9,9 +9,9 @@ hardware or network connection required.
 
 from __future__ import annotations
 
-import queue
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -23,6 +23,7 @@ from fcapz.transport import (
     QuartusStpTransport,
     Transport,
     XilinxHwServerTransport,
+    _StpSession,
     parse_xsdb_jtag_targets,
 )
 
@@ -32,6 +33,15 @@ ROOT = Path(__file__).resolve().parent.parent
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _install_session(t, proc, out=None):
+    """Publish a mocked ``quartus_stp`` session on *t*, as connect() would."""
+    session = _StpSession(proc)
+    if out is not None:
+        session.out = out
+    t._session = session
+    return session
+
 
 class ConcreteTransport(Transport):
     """Minimal concrete Transport for ABC contract tests."""
@@ -509,7 +519,7 @@ class QuartusStpTransportTests(unittest.TestCase):
         proc.poll.return_value = None
         proc.kill = MagicMock()
         t = QuartusStpTransport(read_timeout_sec=0.01)
-        t._proc = proc
+        _install_session(t, proc)
         with self.assertRaises(TimeoutError):
             t._send("puts hello")
         proc.kill.assert_called_once()
@@ -522,9 +532,9 @@ class QuartusStpTransportTests(unittest.TestCase):
         proc.stdout = MagicMock()
         proc.poll.return_value = None
         t = QuartusStpTransport(read_timeout_sec=0.01)
-        t._proc = proc
-        t._stdout_lines.put("ERROR: virtual dr failed\n")
-        t._stdout_lines.put(f"{QuartusStpTransport._SENTINEL}\n")
+        session = _install_session(t, proc)
+        session.out.put("ERROR: virtual dr failed\n")
+        session.out.put(f"{QuartusStpTransport._SENTINEL}\n")
         with self.assertRaisesRegex(RuntimeError, "virtual dr failed"):
             t._send("device_virtual_dr_shift")
 
@@ -534,9 +544,9 @@ class QuartusStpTransportTests(unittest.TestCase):
         proc.stdout = MagicMock()
         proc.poll.return_value = None
         t = QuartusStpTransport(read_timeout_sec=0.01)
-        t._proc = proc
-        t._stdout_lines.put("tcl> tcl> 0001\n")
-        t._stdout_lines.put(f"tcl> {QuartusStpTransport._SENTINEL}\n")
+        session = _install_session(t, proc)
+        session.out.put("tcl> tcl> 0001\n")
+        session.out.put(f"tcl> {QuartusStpTransport._SENTINEL}\n")
         self.assertEqual(t._send("device_virtual_dr_shift"), "0001")
 
     def test_send_strips_quartus_continuation_prompts_and_raises_error(self):
@@ -545,11 +555,11 @@ class QuartusStpTransportTests(unittest.TestCase):
         proc.stdout = MagicMock()
         proc.poll.return_value = None
         t = QuartusStpTransport(read_timeout_sec=0.01)
-        t._proc = proc
-        t._stdout_lines.put("> > > 1\n")
-        t._stdout_lines.put("> > ERROR: virtual dr shift failed\n")
-        t._stdout_lines.put("> >     while executing device_virtual_dr_shift\n")
-        t._stdout_lines.put(f"> {QuartusStpTransport._SENTINEL}\n")
+        session = _install_session(t, proc)
+        session.out.put("> > > 1\n")
+        session.out.put("> > ERROR: virtual dr shift failed\n")
+        session.out.put("> >     while executing device_virtual_dr_shift\n")
+        session.out.put(f"> {QuartusStpTransport._SENTINEL}\n")
         with self.assertRaisesRegex(RuntimeError, "while executing"):
             t._send("device_virtual_dr_shift")
 
@@ -576,9 +586,9 @@ class QuartusStpTransportTests(unittest.TestCase):
         proc.stdout = MagicMock()
         proc.poll.return_value = None
         t = QuartusStpTransport(read_timeout_sec=0.01)
-        t._proc = proc
-        t._stdout_lines.put("ERROR: The specified virtual JTAG instance cannot be found.\n")
-        t._stdout_lines.put(f"{QuartusStpTransport._SENTINEL}\n")
+        session = _install_session(t, proc)
+        session.out.put("ERROR: The specified virtual JTAG instance cannot be found.\n")
+        session.out.put(f"{QuartusStpTransport._SENTINEL}\n")
         with self.assertRaisesRegex(RuntimeError, "No fpgacapZero-compatible cores") as ctx:
             t._send("device_virtual_dr_shift")
         msg = str(ctx.exception)
@@ -591,7 +601,7 @@ class QuartusStpTransportTests(unittest.TestCase):
         proc.stdout = MagicMock()
         proc.poll.return_value = None
         t = QuartusStpTransport()
-        t._proc = proc
+        _install_session(t, proc)
         with self.assertRaises(ValueError):
             t._send(f"puts {QuartusStpTransport._SENTINEL}")
 
@@ -705,10 +715,10 @@ class QuartusStpTransportTests(unittest.TestCase):
         proc.stdout = MagicMock()
         proc.poll.return_value = None
         t = QuartusStpTransport(read_timeout_sec=0.01)
-        t._proc = proc
-        t._stdout_lines.put("tcl> 0\n")
-        t._stdout_lines.put("tcl> 0001\n")
-        t._stdout_lines.put(f"tcl> {QuartusStpTransport._SENTINEL}\n")
+        session = _install_session(t, proc)
+        session.out.put("tcl> 0\n")
+        session.out.put("tcl> 0001\n")
+        session.out.put(f"tcl> {QuartusStpTransport._SENTINEL}\n")
         self.assertEqual(t._send("device_virtual_dr_shift"), "0001")
 
     def test_read_block_uses_one_lock_window(self):
@@ -973,56 +983,6 @@ class QuartusStpTransportTests(unittest.TestCase):
         finally:
             t.close()
 
-    def test_quartus_drain_thread_writes_to_its_own_queue(self):
-        """The EOF marker must land in the queue the thread was started with.
-
-        connect() installs a fresh queue for each session.  A drain thread that
-        looked the queue up on self at put-time would deliver the *previous*
-        process's end-of-stream into the *new* session and make its first scan
-        fail with "process exited unexpectedly".
-
-        The swap has to happen *while the thread is mid-stream*, so the stream
-        blocks on a barrier until the test has replaced the queue.  Without
-        that the thread usually finishes first and the test passes even with
-        the bug present -- it then only detects the changed signature.
-        """
-        released = threading.Event()
-        swapped = threading.Event()
-
-        class BlockingStream:
-            """Yields one line, waits for the queue swap, then yields EOF."""
-
-            def __iter__(self):
-                yield "first\n"
-                swapped.set()
-                if not released.wait(timeout=5):
-                    raise AssertionError("test never released the drain thread")
-                yield "second\n"
-
-        t = QuartusStpTransport()
-        old_queue = queue.Queue()
-        t._stdout_lines = old_queue
-        thread = threading.Thread(
-            target=t._drain_stdout, args=(BlockingStream(), old_queue), daemon=True
-        )
-        thread.start()
-
-        self.assertTrue(swapped.wait(timeout=5), "drain thread never started")
-        new_queue = queue.Queue()
-        t._stdout_lines = new_queue  # what connect() does for the next session
-        released.set()
-        thread.join(timeout=5)
-        self.assertFalse(thread.is_alive())
-
-        drained = []
-        while not old_queue.empty():
-            drained.append(old_queue.get_nowait())
-        self.assertEqual(drained, ["first\n", "second\n", None])
-        self.assertTrue(
-            new_queue.empty(),
-            "the closed session's output leaked into the new session's queue",
-        )
-
     def test_quartus_close_is_bounded_while_another_request_holds_the_io_lock(self):
         """A stalled request elsewhere must not stop close() reaching kill.
 
@@ -1052,12 +1012,12 @@ class QuartusStpTransportTests(unittest.TestCase):
         proc = MagicMock()
         proc.poll.return_value = None
         t = QuartusStpTransport(read_timeout_sec=30.0)
-        t._proc = proc
+        session = _install_session(t, proc)
         stop = threading.Event()
 
         def chatter():
             while not stop.is_set():
-                t._stdout_lines.put("tcl> still working\n")
+                session.out.put("tcl> still working\n")
                 stop.wait(0.01)
 
         feeder = threading.Thread(target=chatter, daemon=True)
@@ -1090,7 +1050,7 @@ class QuartusStpTransportTests(unittest.TestCase):
         new = MagicMock()
         new.poll.return_value = None
         t = QuartusStpTransport(read_timeout_sec=0.3)
-        t._proc = old
+        _install_session(t, old)
         sent = threading.Event()
         old.stdin.flush.side_effect = lambda: sent.set()
         outcome = []
@@ -1106,16 +1066,14 @@ class QuartusStpTransportTests(unittest.TestCase):
         worker.start()
         self.assertTrue(sent.wait(timeout=5), "request never reached the old session")
         # What connect() does while that request is still waiting.
-        t._proc = new
-        t._stdout_lines = queue.Queue()
-        t._poisoned = False
+        replacement = _install_session(t, new)
         worker.join(timeout=5)
 
         self.assertEqual(outcome, ["timeout"])
         old.kill.assert_called()
         new.kill.assert_not_called()
-        self.assertIs(t._proc, new, "the stale timeout detached the new session")
-        self.assertFalse(t._poisoned, "the stale timeout poisoned the new session")
+        self.assertIs(t._session, replacement, "the stale timeout detached the new session")
+        self.assertFalse(replacement.dead, "the stale timeout marked the new session dead")
         old.wait.assert_called()  # reaped, not just signalled
         old.stdout.close.assert_called()
 
@@ -1154,6 +1112,180 @@ class QuartusStpTransportTests(unittest.TestCase):
         self.assertIsNone(t._proc)
         self.assertEqual(len(leaked), 1)
         self.assertIsNotNone(leaked[0].poll(), "connect() failure orphaned quartus_stp")
+
+    # -- review repros: each failed against the previous lifecycle design ----
+
+    def test_quartus_late_response_is_not_read_as_the_next_request(self):
+        """A request that times out may still get its answer later.  The next
+        request must refuse the session rather than take that answer as its
+        own -- it would return another register's value."""
+        retiring = threading.Event()
+
+        class Spy(QuartusStpTransport):
+            def _retire_session(self, *args):
+                retiring.set()
+                super()._retire_session(*args)
+
+        proc = MagicMock()
+        proc.poll.return_value = None
+        t = Spy(read_timeout_sec=5.0)
+        session = _install_session(t, proc)
+        outcome = []
+
+        def request_a():
+            try:
+                t._send("puts A", timeout=0.2)
+                outcome.append("returned")
+            except TimeoutError:
+                outcome.append("timeout")
+
+        # Holding the lifecycle lock stalls A between releasing the I/O lock
+        # and retiring its session: the window in which B can get in.
+        t._life_lock.acquire()
+        try:
+            a = threading.Thread(target=request_a, daemon=True)
+            a.start()
+            self.assertTrue(retiring.wait(timeout=5), "request A never timed out")
+            session.out.put(f"tcl> {0x11111111:049b}\n")  # A's late answer
+            session.out.put(f"tcl> {QuartusStpTransport._SENTINEL}\n")
+            with self.assertRaisesRegex(RuntimeError, "reconnect"):
+                t._send("puts B")
+        finally:
+            t._life_lock.release()
+        a.join(timeout=5)
+        self.assertEqual(outcome, ["timeout"])
+
+    def test_quartus_close_cancels_a_connect_stuck_in_its_handshake(self):
+        """The GUI cancels a connect by calling close() from another thread.
+        An open_device that keeps printing without ever finishing must not
+        make that close() wait for the connect to give up by itself."""
+        t = self._fake_quartus("fake_quartus_stp_chatty.py")
+        t.read_timeout_sec = 30.0
+        t.CLOSE_GRACE_SEC = 0.3
+        t.CLOSE_TERM_SEC = 0.3
+        t.CLOSE_KILL_SEC = 1.0
+        outcome = []
+
+        def connect():
+            try:
+                t.connect()
+                outcome.append("connected")
+            except Exception as exc:
+                outcome.append(type(exc).__name__)
+
+        connector = threading.Thread(target=connect, daemon=True)
+        connector.start()
+        deadline = time.monotonic() + 5
+        while t._proc is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        proc = t._proc
+        self.assertIsNotNone(proc, "connect() never started quartus_stp")
+        self.addCleanup(proc.kill)
+        closer = threading.Thread(target=t.close, daemon=True)
+        closer.start()
+        closer.join(timeout=5)
+        self.assertFalse(closer.is_alive(), "close() waited on the stuck connect()")
+        connector.join(timeout=5)
+        self.assertFalse(connector.is_alive(), "connect() never unwound")
+        self.assertEqual(len(outcome), 1)
+        self.assertNotEqual(outcome, ["connected"])
+        self.assertIsNotNone(proc.poll(), "the cancelled quartus_stp is still running")
+        self.assertIsNone(t._proc)
+
+    def test_quartus_concurrent_closes_both_return_and_reap(self):
+        """A second close() arriving while the first is still tearing down
+        waits its turn or kills the session; either way both return and the
+        process is gone."""
+        t = self._fake_quartus("fake_quartus_stp_stubborn.py")
+        t.CLOSE_GRACE_SEC = 1.5
+        t.CLOSE_TERM_SEC = 0.3
+        t.CLOSE_KILL_SEC = 1.0
+        t.connect()
+        proc = t._proc
+        self.addCleanup(proc.kill)
+        first = threading.Thread(target=t.close, daemon=True)
+        second = threading.Thread(target=t.close, daemon=True)
+        first.start()
+        time.sleep(0.1)
+        second.start()
+        first.join(timeout=10)
+        second.join(timeout=10)
+        self.assertFalse(first.is_alive() or second.is_alive(), "a close() never returned")
+        self.assertIsNotNone(proc.poll(), "quartus_stp survived two closes")
+        self.assertIsNone(t._proc)
+
+    def test_quartus_request_during_reconnect_sees_one_whole_session(self):
+        """A request that arrives the instant a reconnect makes its session
+        visible must get the new process together with the new output queue,
+        never the new process with the old queue."""
+        raced = []
+
+        class Racing(QuartusStpTransport):
+            armed = False
+
+            def __setattr__(self, name, value):
+                super().__setattr__(name, value)
+                if self.armed and name == "_session" and value is not None:
+                    self.armed = False
+                    worker = threading.Thread(target=self._race, daemon=True)
+                    worker.start()
+                    worker.join(timeout=10)
+
+            def _race(self):
+                try:
+                    raced.append(self.read_reg(0x20))
+                except Exception as exc:
+                    raced.append(exc)
+
+        t = Racing(
+            quartus_stp_argv=[
+                sys.executable,
+                str(ROOT / "tests" / "fixtures" / "fake_quartus_stp.py"),
+                "-s",
+            ],
+            read_timeout_sec=5.0,
+        )
+        t.connect()
+        try:
+            t.armed = True
+            t.connect()  # retires the first session, then publishes a new one
+            self.assertEqual(len(raced), 1, "the racing request never ran")
+            self.assertNotIsInstance(raced[0], ConnectionError, repr(raced[0]))
+            self.assertEqual(t.opened_device, "FAKE_FPGA")
+            self.assertEqual(t.read_reg(0x20), 0x12345678)
+        finally:
+            t.close()
+
+    def test_quartus_send_deadline_holds_while_output_is_queued(self):
+        """Queue.get(timeout=0) still returns a queued line, so a deadline
+        enforced only through get() never fires while output is backed up."""
+
+        class Endless:
+            """An output queue that is never empty and never has the sentinel."""
+
+            def get(self, timeout=None):
+                time.sleep(0.001)
+                return "tcl> still working\n"
+
+        proc = MagicMock()
+        proc.poll.return_value = None
+        t = QuartusStpTransport(read_timeout_sec=30.0)
+        _install_session(t, proc, out=Endless())
+        outcome = []
+
+        def request():
+            try:
+                t._send("puts hello", timeout=0.2)
+                outcome.append("returned")
+            except TimeoutError:
+                outcome.append("timeout")
+
+        worker = threading.Thread(target=request, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive(), "queued output kept the request past its deadline")
+        self.assertEqual(outcome, ["timeout"])
+        proc.kill.assert_called()
 
 
 # ---------------------------------------------------------------------------
