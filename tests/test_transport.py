@@ -9,7 +9,6 @@ hardware or network connection required.
 
 from __future__ import annotations
 
-import io
 import queue
 import sys
 import threading
@@ -980,24 +979,49 @@ class QuartusStpTransportTests(unittest.TestCase):
         connect() installs a fresh queue for each session.  A drain thread that
         looked the queue up on self at put-time would deliver the *previous*
         process's end-of-stream into the *new* session and make its first scan
-        fail with "process exited unexpectedly"."""
+        fail with "process exited unexpectedly".
+
+        The swap has to happen *while the thread is mid-stream*, so the stream
+        blocks on a barrier until the test has replaced the queue.  Without
+        that the thread usually finishes first and the test passes even with
+        the bug present -- it then only detects the changed signature.
+        """
+        released = threading.Event()
+        swapped = threading.Event()
+
+        class BlockingStream:
+            """Yields one line, waits for the queue swap, then yields EOF."""
+
+            def __iter__(self):
+                yield "first\n"
+                swapped.set()
+                if not released.wait(timeout=5):
+                    raise AssertionError("test never released the drain thread")
+                yield "second\n"
+
         t = QuartusStpTransport()
         old_queue = queue.Queue()
-        stream = io.StringIO("one\ntwo\n")
         t._stdout_lines = old_queue
         thread = threading.Thread(
-            target=t._drain_stdout, args=(stream, old_queue), daemon=True
+            target=t._drain_stdout, args=(BlockingStream(), old_queue), daemon=True
         )
         thread.start()
+
+        self.assertTrue(swapped.wait(timeout=5), "drain thread never started")
         new_queue = queue.Queue()
-        t._stdout_lines = new_queue  # what connect() does
+        t._stdout_lines = new_queue  # what connect() does for the next session
+        released.set()
         thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
+
         drained = []
         while not old_queue.empty():
             drained.append(old_queue.get_nowait())
-        self.assertEqual(drained, ["one\n", "two\n", None])
-        self.assertTrue(new_queue.empty(), "EOF marker leaked into the new session")
+        self.assertEqual(drained, ["first\n", "second\n", None])
+        self.assertTrue(
+            new_queue.empty(),
+            "the closed session's output leaked into the new session's queue",
+        )
 
     def test_quartus_connect_failure_does_not_orphan_the_process(self):
         """A failed open must not leave quartus_stp holding the cable."""
