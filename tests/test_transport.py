@@ -1023,6 +1023,115 @@ class QuartusStpTransportTests(unittest.TestCase):
             "the closed session's output leaked into the new session's queue",
         )
 
+    def test_quartus_close_is_bounded_while_another_request_holds_the_io_lock(self):
+        """A stalled request elsewhere must not stop close() reaching kill.
+
+        The graceful teardown needs the I/O lock; if another thread's request
+        is stuck holding it, close() has to give up on that and escalate
+        rather than wait for the lock forever.
+        """
+        t = self._fake_quartus()
+        t.CLOSE_GRACE_SEC = 0.3
+        t.CLOSE_TERM_SEC = 0.5
+        t.CLOSE_KILL_SEC = 1.0
+        t.connect()
+        proc = t._proc
+        t._stp_io_lock.acquire()  # a request on another thread, stalled
+        try:
+            closer = threading.Thread(target=t.close, daemon=True)
+            closer.start()
+            closer.join(timeout=5)
+            self.assertFalse(closer.is_alive(), "close() blocked on the I/O lock")
+            self.assertIsNotNone(proc.poll(), "close() returned with quartus_stp alive")
+        finally:
+            t._stp_io_lock.release()
+
+    def test_quartus_send_deadline_is_not_reset_by_chatter(self):
+        """With a timeout, output that never contains the sentinel must not
+        keep a request alive: the deadline covers the whole response."""
+        proc = MagicMock()
+        proc.poll.return_value = None
+        t = QuartusStpTransport(read_timeout_sec=30.0)
+        t._proc = proc
+        stop = threading.Event()
+
+        def chatter():
+            while not stop.is_set():
+                t._stdout_lines.put("tcl> still working\n")
+                stop.wait(0.01)
+
+        feeder = threading.Thread(target=chatter, daemon=True)
+        feeder.start()
+        outcome = []
+
+        def request():
+            try:
+                t._send("puts hello", timeout=0.2)
+                outcome.append("returned")
+            except TimeoutError:
+                outcome.append("timeout")
+
+        try:
+            worker = threading.Thread(target=request, daemon=True)
+            worker.start()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive(), "chatter kept resetting the deadline")
+            self.assertEqual(outcome, ["timeout"])
+        finally:
+            stop.set()
+            feeder.join(timeout=2)
+
+    def test_quartus_stale_timeout_does_not_kill_the_replacement_session(self):
+        """A request that times out on the old session must retire THAT
+        session only, and reap it, even if connect() has already installed a
+        new one on the transport."""
+        old = MagicMock()
+        old.poll.return_value = None
+        new = MagicMock()
+        new.poll.return_value = None
+        t = QuartusStpTransport(read_timeout_sec=0.3)
+        t._proc = old
+        sent = threading.Event()
+        old.stdin.flush.side_effect = lambda: sent.set()
+        outcome = []
+
+        def request():
+            try:
+                t._send("puts hello")
+                outcome.append("returned")
+            except TimeoutError:
+                outcome.append("timeout")
+
+        worker = threading.Thread(target=request, daemon=True)
+        worker.start()
+        self.assertTrue(sent.wait(timeout=5), "request never reached the old session")
+        # What connect() does while that request is still waiting.
+        t._proc = new
+        t._stdout_lines = queue.Queue()
+        t._poisoned = False
+        worker.join(timeout=5)
+
+        self.assertEqual(outcome, ["timeout"])
+        old.kill.assert_called()
+        new.kill.assert_not_called()
+        self.assertIs(t._proc, new, "the stale timeout detached the new session")
+        self.assertFalse(t._poisoned, "the stale timeout poisoned the new session")
+        old.wait.assert_called()  # reaped, not just signalled
+        old.stdout.close.assert_called()
+
+    def test_quartus_connect_retires_a_session_still_open(self):
+        """connect() on an open transport must not leak the previous process,
+        which would otherwise keep holding the cable with nothing to close it."""
+        t = self._fake_quartus()
+        t.connect()
+        first = t._proc
+        t.connect()
+        try:
+            self.assertIsNotNone(first.poll(), "the replaced quartus_stp is still running")
+            self.assertEqual(t.read_reg(0x20), 0x12345678)
+        finally:
+            t.close()
+
     def test_quartus_connect_failure_does_not_orphan_the_process(self):
         """A failed open must not leave quartus_stp holding the cable."""
         leaked = []
