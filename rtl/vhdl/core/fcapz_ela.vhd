@@ -167,6 +167,9 @@ architecture rtl of fcapz_ela is
     constant SEG_IDX_W        : positive := fcapz_clog2(NUM_SEGMENTS);
     constant SEQ_STATE_W      : positive := fcapz_clog2(TRIG_STAGES);
     constant TS_WIDTH         : positive := fcapz_nonzero_width(TIMESTAMP_W);
+    -- INPUT_PIPE probe register stages; the array keeps one when INPUT_PIPE = 0
+    -- so its bounds stay legal, and that stage is then unused.
+    constant PIPE_STAGES      : positive := fcapz_nonzero_width(INPUT_PIPE);
     constant TS_WORDS         : natural := (TIMESTAMP_W + 31) / 32;
 
     constant ADDR_VERSION      : natural := 16#0000#;
@@ -376,15 +379,17 @@ architecture rtl of fcapz_ela is
     signal trig_holdoff_count: unsigned(15 downto 0) := (others => '0');
     signal trig_holdoff_active : std_logic := '0';
     signal startup_arm_pending : std_logic := bool_to_sl(STARTUP_ARM /= 0);
-    signal pipe_probe        : std_logic_vector(SAMPLE_W - 1 downto 0) := (others => '0');
-    signal hit_pipe          : std_logic := '0';
+    signal pipe_probe        : sample_array_t(0 to PIPE_STAGES - 1) := (others => (others => '0'));
+    signal hit_a_pipe        : std_logic := '0';
+    signal hit_b_pipe        : std_logic := '0';
     signal sq_pipe           : std_logic := '0';
     signal jtag_rdata_mux    : std_logic_vector(31 downto 0) := (others => '0');
     signal jtag_rdata_i      : std_logic_vector(31 downto 0) := (others => '0');
     signal mem_we_a          : std_logic := '0';
     signal mem_we_a_q        : std_logic := '0';
     signal mem_we_a_ram      : std_logic := '0';
-    signal comb_hit          : std_logic := '0';
+    signal comb_hit_a        : std_logic := '0';
+    signal comb_hit_b        : std_logic := '0';
     signal comb_hit_eff      : std_logic := '0';
     signal comb_sq_ok        : std_logic := '1';
     signal comb_store_ok     : std_logic := '0';
@@ -663,7 +668,6 @@ begin
         variable hit_a : std_logic;
         variable hit_b : std_logic;
         variable seq_stage_hit : std_logic;
-        variable hit : std_logic;
         variable hit_eff : std_logic;
         variable sq_ok : boolean;
         variable sq_eff : boolean;
@@ -684,7 +688,7 @@ begin
         end if;
 
         if INPUT_PIPE > 0 then
-            compare_probe := pipe_probe;
+            compare_probe := pipe_probe(PIPE_STAGES - 1);
         else
             compare_probe := active_probe;
         end if;
@@ -695,8 +699,6 @@ begin
             store_tick := decim_count = 0;
         end if;
 
-        hit_internal := '0';
-        seq_stage_hit := '0';
         if TRIG_STAGES > 1 then
             hit_a := cmp_hit(
                 compare_probe,
@@ -715,6 +717,28 @@ begin
                     seq_mode_b(seq_state)
                 );
             end if;
+        else
+            hit_a := cmp_hit(compare_probe, probe_prev, trig_value, trig_mask, trig_cmp_mode_a);
+            hit_b := '0';
+            if DUAL_COMPARE /= 0 then
+                hit_b := cmp_hit(compare_probe, probe_prev, trig_value_b, trig_mask_b, trig_cmp_mode_b);
+            end if;
+        end if;
+        comb_hit_a <= hit_a;
+        comb_hit_b <= hit_b;
+
+        -- With INPUT_PIPE > 0 only the raw A/B compares are registered, as in
+        -- rtl/fcapz_ela.v.  Stage combine, final and count qualification then
+        -- use the current seq_state and seq_counter, so the trigger, the
+        -- stage advance and the hit count all see the same registered hit.
+        if INPUT_PIPE > 0 then
+            hit_a := hit_a_pipe;
+            hit_b := hit_b_pipe;
+        end if;
+
+        hit_internal := '0';
+        seq_stage_hit := '0';
+        if TRIG_STAGES > 1 then
             case seq_combine(seq_state) is
                 when "01" => seq_stage_hit := hit_b;
                 when "10" => seq_stage_hit := hit_a and hit_b;
@@ -727,11 +751,6 @@ begin
                 end if;
             end if;
         else
-            hit_a := cmp_hit(compare_probe, probe_prev, trig_value, trig_mask, trig_cmp_mode_a);
-            hit_b := '0';
-            if DUAL_COMPARE /= 0 then
-                hit_b := cmp_hit(compare_probe, probe_prev, trig_value_b, trig_mask_b, trig_cmp_mode_b);
-            end if;
             if DUAL_COMPARE = 0 then
                 hit_internal := hit_a;
             else
@@ -745,9 +764,9 @@ begin
         end if;
 
         case ext_trig_mode is
-            when "01" => hit := hit_internal or trigger_in_sync2;
-            when "10" => hit := hit_internal and trigger_in_sync2;
-            when others => hit := hit_internal;
+            when "01" => hit_eff := hit_internal or trigger_in_sync2;
+            when "10" => hit_eff := hit_internal and trigger_in_sync2;
+            when others => hit_eff := hit_internal;
         end case;
 
         sq_ok := true;
@@ -762,14 +781,8 @@ begin
         end if;
 
         if INPUT_PIPE > 0 then
-            case ext_trig_mode is
-                when "01" => hit_eff := hit_pipe or trigger_in_sync2;
-                when "10" => hit_eff := hit_pipe and trigger_in_sync2;
-                when others => hit_eff := hit_pipe;
-            end case;
             sq_eff := (STOR_QUAL = 0) or (sq_enable = '0') or (sq_pipe = '1');
         else
-            hit_eff := hit;
             sq_eff := sq_ok;
         end if;
         store_ok := store_tick and sq_eff;
@@ -778,7 +791,6 @@ begin
                               trig_holdoff_active = '0' and
                               ((trig_delay_pending = '1' and trig_delay_count = 0) or
                                (trig_delay_pending = '0' and hit_eff = '1' and trig_delay = 0));
-        comb_hit <= hit_internal;
         comb_hit_eff <= hit_eff;
         comb_sq_ok <= bool_to_sl(sq_ok);
         comb_store_ok <= bool_to_sl(store_ok);
@@ -920,13 +932,16 @@ begin
                 else
                     probe_sel <= 0;
                 end if;
+                -- From the synchronisers, like every other field latched
+                -- here: jtag_decim / jtag_trig_ext belong to the JTAG clock
+                -- domain.  Mirrors rtl/fcapz_ela.v.
                 if DECIM_EN /= 0 then
-                    decim_ratio <= unsigned(jtag_decim);
+                    decim_ratio <= decim_sync2;
                 else
                     decim_ratio <= (others => '0');
                 end if;
                 if EXT_TRIG_EN /= 0 then
-                    ext_trig_mode <= jtag_trig_ext;
+                    ext_trig_mode <= trig_ext_sync2;
                 else
                     ext_trig_mode <= (others => '0');
                 end if;
@@ -1360,15 +1375,8 @@ begin
     p_capture : process(sample_clk, sample_rst)
         variable active_probe : std_logic_vector(SAMPLE_W - 1 downto 0);
         variable compare_probe : std_logic_vector(SAMPLE_W - 1 downto 0);
-        variable hit_internal : std_logic;
-        variable hit_a : std_logic;
-        variable hit_b : std_logic;
-        variable seq_stage_hit : std_logic;
-        variable hit : std_logic;
         variable hit_eff : std_logic;
-        variable sq_ok : boolean;
         variable sq_eff : boolean;
-        variable store_tick : boolean;
         variable store_ok : boolean;
         variable base : natural;
         variable start_calc : natural;
@@ -1412,8 +1420,9 @@ begin
             trig_holdoff_active <= '0';
             trigger_in_sync1 <= '0';
             trigger_in_sync2 <= '0';
-            pipe_probe <= (others => '0');
-            hit_pipe <= '0';
+            pipe_probe <= (others => (others => '0'));
+            hit_a_pipe <= '0';
+            hit_b_pipe <= '0';
             sq_pipe <= '0';
         elsif rising_edge(sample_clk) then
             if EXT_TRIG_EN /= 0 then
@@ -1439,89 +1448,22 @@ begin
                 active_probe := probe_in(SAMPLE_W - 1 downto 0);
             end if;
             if INPUT_PIPE > 0 then
-                compare_probe := pipe_probe;
-                pipe_probe <= active_probe;
+                -- INPUT_PIPE stages, as rtl/fcapz_ela.v builds them.
+                compare_probe := pipe_probe(PIPE_STAGES - 1);
+                pipe_probe(0) <= active_probe;
+                for i in 1 to PIPE_STAGES - 1 loop
+                    pipe_probe(i) <= pipe_probe(i - 1);
+                end loop;
             else
                 compare_probe := active_probe;
-            end if;
-
-            if DECIM_EN = 0 then
-                store_tick := true;
-            else
-                store_tick := decim_count = 0;
-            end if;
-
-            hit_internal := '0';
-            seq_stage_hit := '0';
-            if TRIG_STAGES > 1 then
-                hit_a := cmp_hit(
-                    compare_probe,
-                    probe_prev,
-                    seq_value_a(seq_state),
-                    seq_mask_a(seq_state),
-                    seq_mode_a(seq_state)
-                );
-                hit_b := '0';
-                if DUAL_COMPARE /= 0 then
-                    hit_b := cmp_hit(
-                        compare_probe,
-                        probe_prev,
-                        seq_value_b(seq_state),
-                        seq_mask_b(seq_state),
-                        seq_mode_b(seq_state)
-                    );
-                end if;
-                case seq_combine(seq_state) is
-                    when "01" => seq_stage_hit := hit_b;
-                    when "10" => seq_stage_hit := hit_a and hit_b;
-                    when "11" => seq_stage_hit := hit_a or hit_b;
-                    when others => seq_stage_hit := hit_a;
-                end case;
-                if seq_stage_hit = '1' and seq_is_final(seq_state) = '1' then
-                    if seq_count_target(seq_state) = 0 or seq_counter + 1 >= seq_count_target(seq_state) then
-                        hit_internal := '1';
-                    end if;
-                end if;
-            else
-                hit_a := cmp_hit(compare_probe, probe_prev, trig_value, trig_mask, trig_cmp_mode_a);
-                hit_b := '0';
-                if DUAL_COMPARE /= 0 then
-                    hit_b := cmp_hit(compare_probe, probe_prev, trig_value_b, trig_mask_b, trig_cmp_mode_b);
-                end if;
-                if DUAL_COMPARE = 0 then
-                    hit_internal := hit_a;
-                else
-                    case trig_combine is
-                        when "01" => hit_internal := hit_b;
-                        when "10" => hit_internal := hit_a and hit_b;
-                        when "11" => hit_internal := hit_a or hit_b;
-                        when others => hit_internal := hit_a;
-                    end case;
-                end if;
-            end if;
-
-            case ext_trig_mode is
-                when "01" => hit := hit_internal or trigger_in_sync2;
-                when "10" => hit := hit_internal and trigger_in_sync2;
-                when others => hit := hit_internal;
-            end case;
-
-            sq_ok := true;
-            if STOR_QUAL /= 0 and sq_enable = '1' then
-                sq_ok := cmp_hit(
-                    compare_probe,
-                    probe_prev,
-                    sq_value,
-                    sq_mask,
-                    sq_cmp_mode
-                ) = '1';
             end if;
 
             hit_eff := comb_hit_eff;
             sq_eff := comb_sq_ok = '1';
             store_ok := comb_store_ok = '1';
             seg_start_next := seg_start_ptr;
-            hit_pipe <= comb_hit;
+            hit_a_pipe <= comb_hit_a;
+            hit_b_pipe <= comb_hit_b;
             sq_pipe <= comb_sq_ok;
             reset_pulse_now := (reset_toggle_sync1 xor reset_toggle_sync2) = '1';
             arm_pulse_now := (arm_toggle_sync1 xor arm_toggle_sync2) = '1';
@@ -1566,7 +1508,8 @@ begin
                 trig_holdoff_count <= (others => '0');
                 seq_state <= 0;
                 seq_counter <= (others => '0');
-                hit_pipe <= '0';
+                hit_a_pipe <= '0';
+                hit_b_pipe <= '0';
                 sq_pipe <= '0';
             end if;
 
@@ -1614,14 +1557,20 @@ begin
                 trig_holdoff_count <= trig_holdoff_sync2 - 1 when trig_holdoff_sync2 > 0 else (others => '0');
                 seq_state <= 0;
                 seq_counter <= (others => '0');
-                hit_pipe <= '0';
+                hit_a_pipe <= '0';
+                hit_b_pipe <= '0';
                 sq_pipe <= '0';
             end if;
 
+            -- Idle prefill is single-segment only, as in rtl/fcapz_ela.v: a
+            -- segmented capture restarts at address 0 on arm, and this block
+            -- runs after the arm block on the arm edge (armed is still '0'),
+            -- so an unguarded wr_ptr update here would override that reset
+            -- and start segment 0 on stale pre-arm samples.
             if armed = '0' and done = '0' then
                 trig_delay_pending <= '0';
                 trig_delay_count <= (others => '0');
-                if store_ok then
+                if NUM_SEGMENTS = 1 and store_ok then
                     if pre_count < count_u(pretrig_len) then
                         pre_count <= pre_count + 1;
                     end if;
@@ -1670,8 +1619,15 @@ begin
                             trig_delay_count <= trig_delay - 1;
                         end if;
                     elsif pre_count >= count_u(pretrig_len) and trig_holdoff_active = '0' and
-                          TRIG_STAGES > 1 and comb_seq_stage_hit = '1' and seq_is_final(seq_state) = '0' then
-                        if seq_count_target(seq_state) = 0 or seq_counter + 1 >= seq_count_target(seq_state) then
+                          TRIG_STAGES > 1 and comb_seq_stage_hit = '1' then
+                        -- Mirrors seq_advance in rtl/fcapz_ela.v: a final
+                        -- stage never advances, but its hits still count, or
+                        -- a final stage with count target > 1 never triggers.
+                        -- Its terminal hit is taken by the trigger branch
+                        -- above; reaching here with the count met means the
+                        -- external-trigger combine held it back.
+                        if seq_is_final(seq_state) = '0' and
+                           (seq_count_target(seq_state) = 0 or seq_counter + 1 >= seq_count_target(seq_state)) then
                             seq_state <= to_integer(unsigned(seq_next_state(seq_state)));
                             seq_counter <= (others => '0');
                         else
@@ -1745,7 +1701,8 @@ begin
                                 trig_holdoff_count <= trig_holdoff - 1 when trig_holdoff > 0 else (others => '0');
                                 seq_state <= 0;
                                 seq_counter <= (others => '0');
-                                hit_pipe <= '0';
+                                hit_a_pipe <= '0';
+                                hit_b_pipe <= '0';
                                 sq_pipe <= '0';
                             end if;
                         end if;
@@ -1793,7 +1750,8 @@ begin
                                     trig_holdoff_count <= trig_holdoff - 1 when trig_holdoff > 0 else (others => '0');
                                     seq_state <= 0;
                                     seq_counter <= (others => '0');
-                                    hit_pipe <= '0';
+                                    hit_a_pipe <= '0';
+                                    hit_b_pipe <= '0';
                                     sq_pipe <= '0';
                                 end if;
                             end if;

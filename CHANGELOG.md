@@ -70,6 +70,34 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **ELA — one stale sample after a soft reset with `INPUT_PIPE ≥ 1`.** Arming
+  (and soft reset) cancelled the RAM write queued in the input pipeline while
+  the write pointer still advanced, so that address kept a sample one
+  buffer-length old. It shows only when a pre-trigger window reaches back across
+  the arm, which after a soft reset it can: the first capture after
+  `force_idle()` or `Analyzer.reset()`, when the trigger fires within the
+  pre-trigger length of the arm, had one wrong sample at the arm point. In the
+  shipped examples that is the AXI monitors (single-segment, `INPUT_PIPE=1`);
+  segmented ELAs never build pre-arm history and were not affected, nor were
+  captures re-armed straight after a completed one. The queued write now always
+  lands, as it does with `INPUT_PIPE=0`.
+
+- **ELA (native VHDL) — four behaviours now match the Verilog core.**
+  - A segmented capture could start segment 0 on stale pre-arm samples: the
+    idle block's write-pointer update overrode the reset to address 0 on the
+    arm edge. The window was wrong while the capture reported success.
+  - A final sequencer stage with a count target above 1 never triggered; its
+    hits were not counted. With `INPUT_PIPE ≥ 1` the VHDL also registered the
+    fully qualified trigger instead of the raw comparator hits, so a stage
+    could count one hit and trigger on another; a hit landing on the last
+    holdoff cycle was dropped from the count and could leave the capture
+    armed for good. It now registers the comparator hits as Verilog does.
+  - `INPUT_PIPE` built one probe register whatever its value, so with 2 or more
+    the window sat one or more samples late.
+  - Decimation and external-trigger mode were latched on arm straight from the
+    JTAG clock domain instead of through their synchronisers, so a write close
+    to arm could apply to that capture, or be sampled mid-change.
+
 - **Intel/Altera — `close()` now waits for `quartus_stp` to exit.**
   `QuartusStpTransport.close()` signalled the process and returned at once, so
   it could return while `quartus_stp` was still alive and still attached to the
