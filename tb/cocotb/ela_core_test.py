@@ -1107,6 +1107,54 @@ async def sequencer_final_stage_counts_to_target(dut):
     FUNCTIONAL_COVERAGE.hit("sequencer")
 
 
+async def _final_stage_hits_after_holdoff(ela, target: int, hits: tuple[int, ...]) -> int | None:
+    """Arm a final stage matching low nibble 3 behind an 8-cycle holdoff and put
+    its hits at the given sample cycles after arm.  Every sample carries its
+    cycle number in the high nibble; returns that of the trigger sample, or
+    None if the capture never triggered."""
+    dut = ela.dut
+    await ela.reset_core()
+    await ela.write(ADDR_PRETRIG, 0)
+    await ela.write(ADDR_POSTTRIG, 0)
+    await ela.write(ADDR_SEQ_BASE + 0, (target << 16) | 0x1000)  # final, EQ
+    await ela.write(ADDR_SEQ_BASE + 4, 3)
+    await ela.write(ADDR_SEQ_BASE + 8, 0x0F)
+    await ela.write(ADDR_TRIG_HOLDOFF, 8)
+    dut.probe_in.value = 0
+    await ela.arm()
+    for cycle in range(40):
+        dut.probe_in.value = ((cycle & 0xF) << 4) | (3 if cycle in hits else 0)
+        await RisingEdge(dut.sample_clk)
+    dut.probe_in.value = 0
+    if not await ela.read(ADDR_STATUS) & 0x4:
+        return None
+    return (await ela.read(ADDR_DATA_BASE) & 0xFF) >> 4
+
+
+@cocotb.test()
+async def sequencer_counts_first_hit_after_holdoff(dut):
+    """A hit that can trigger a count-1 final stage is also counted by a
+    count-2 one.  With INPUT_PIPE >= 1 the hit that first clears the holdoff
+    was compared while the holdoff still ran; the count must follow the
+    registered hit, as the trigger does."""
+    ela = await setup(dut)
+    # Find the first cycle after arm at which a single hit triggers.
+    for first in range(24):
+        anchor = await _final_stage_hits_after_holdoff(ela, 1, (first,))
+        if anchor is not None:
+            break
+    else:
+        raise AssertionError("no single hit triggered within 24 cycles of arm")
+    assert first > 0, "the holdoff did not hold off the first hit"
+    latency = (anchor - first) & 0xF
+    # Count 2 with its first hit on that cycle: the second hit triggers.
+    second = first + 5
+    anchor = await _final_stage_hits_after_holdoff(ela, 2, (first, second))
+    assert anchor is not None, f"hit at cycle {first} was not counted"
+    assert anchor == (second + latency) & 0xF, (first, second, latency, anchor)
+    FUNCTIONAL_COVERAGE.hit("sequencer")
+
+
 @cocotb.test()
 async def input_pipe_depth_sets_capture_latency(dut):
     """Every INPUT_PIPE stage delays the probe by one sample clock against the

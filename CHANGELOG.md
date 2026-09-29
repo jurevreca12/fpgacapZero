@@ -87,7 +87,11 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     idle block's write-pointer update overrode the reset to address 0 on the
     arm edge. The window was wrong while the capture reported success.
   - A final sequencer stage with a count target above 1 never triggered; its
-    hits were not counted.
+    hits were not counted. With `INPUT_PIPE ≥ 1` the VHDL also registered the
+    fully qualified trigger instead of the raw comparator hits, so a stage
+    could count one hit and trigger on another; a hit landing on the last
+    holdoff cycle was dropped from the count and could leave the capture
+    armed for good. It now registers the comparator hits as Verilog does.
   - `INPUT_PIPE` built one probe register whatever its value, so with 2 or more
     the window sat one or more samples late.
   - Decimation and external-trigger mode were latched on arm straight from the
