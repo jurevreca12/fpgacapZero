@@ -1108,6 +1108,28 @@ async def sequencer_final_stage_counts_to_target(dut):
 
 
 @cocotb.test()
+async def input_pipe_depth_sets_capture_latency(dut):
+    """Every INPUT_PIPE stage delays the probe by one sample clock against the
+    external trigger, so the committed sample moves back one count per stage."""
+    ela = await setup(dut)
+    await ela.write(ADDR_TRIG_EXT, 1)  # OR: the external pulse alone triggers
+    await ela.configure_value_capture(pre=0, post=3, value=0xFF, mask=0xFF)
+    dut.trigger_in.value = 0
+    await ela.arm()
+    pulse_at = 40
+    for cycle in range(64):
+        dut.probe_in.value = cycle
+        dut.trigger_in.value = 1 if cycle == pulse_at else 0
+        await RisingEdge(dut.sample_clk)
+    dut.trigger_in.value = 0
+    assert await ela.wait_done() & 0x4
+    window = [s & 0xFF for s in await ela.read_samples(4)]
+    dut._log.info("INPUT_PIPE=%d pulse at %d window %s", INPUT_PIPE, pulse_at, window)
+    assert counter_steps(window) == [1, 1, 1], window
+    assert window[0] == pulse_at + INPUT_PIPE_ANCHOR_OFFSET - INPUT_PIPE, window
+
+
+@cocotb.test()
 async def config_written_after_arm_does_not_reach_armed_capture(dut):
     """Arm latches decimation and trigger mode from their synchronised copies.
     With the sample clock slower than JTAG, a write landing just after ARM is

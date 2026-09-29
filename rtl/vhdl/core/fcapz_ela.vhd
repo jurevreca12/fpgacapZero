@@ -167,6 +167,9 @@ architecture rtl of fcapz_ela is
     constant SEG_IDX_W        : positive := fcapz_clog2(NUM_SEGMENTS);
     constant SEQ_STATE_W      : positive := fcapz_clog2(TRIG_STAGES);
     constant TS_WIDTH         : positive := fcapz_nonzero_width(TIMESTAMP_W);
+    -- INPUT_PIPE probe register stages; the array keeps one when INPUT_PIPE = 0
+    -- so its bounds stay legal, and that stage is then unused.
+    constant PIPE_STAGES      : positive := fcapz_nonzero_width(INPUT_PIPE);
     constant TS_WORDS         : natural := (TIMESTAMP_W + 31) / 32;
 
     constant ADDR_VERSION      : natural := 16#0000#;
@@ -376,7 +379,7 @@ architecture rtl of fcapz_ela is
     signal trig_holdoff_count: unsigned(15 downto 0) := (others => '0');
     signal trig_holdoff_active : std_logic := '0';
     signal startup_arm_pending : std_logic := bool_to_sl(STARTUP_ARM /= 0);
-    signal pipe_probe        : std_logic_vector(SAMPLE_W - 1 downto 0) := (others => '0');
+    signal pipe_probe        : sample_array_t(0 to PIPE_STAGES - 1) := (others => (others => '0'));
     signal hit_pipe          : std_logic := '0';
     signal sq_pipe           : std_logic := '0';
     signal jtag_rdata_mux    : std_logic_vector(31 downto 0) := (others => '0');
@@ -684,7 +687,7 @@ begin
         end if;
 
         if INPUT_PIPE > 0 then
-            compare_probe := pipe_probe;
+            compare_probe := pipe_probe(PIPE_STAGES - 1);
         else
             compare_probe := active_probe;
         end if;
@@ -1415,7 +1418,7 @@ begin
             trig_holdoff_active <= '0';
             trigger_in_sync1 <= '0';
             trigger_in_sync2 <= '0';
-            pipe_probe <= (others => '0');
+            pipe_probe <= (others => (others => '0'));
             hit_pipe <= '0';
             sq_pipe <= '0';
         elsif rising_edge(sample_clk) then
@@ -1442,8 +1445,12 @@ begin
                 active_probe := probe_in(SAMPLE_W - 1 downto 0);
             end if;
             if INPUT_PIPE > 0 then
-                compare_probe := pipe_probe;
-                pipe_probe <= active_probe;
+                -- INPUT_PIPE stages, as rtl/fcapz_ela.v builds them.
+                compare_probe := pipe_probe(PIPE_STAGES - 1);
+                pipe_probe(0) <= active_probe;
+                for i in 1 to PIPE_STAGES - 1 loop
+                    pipe_probe(i) <= pipe_probe(i - 1);
+                end loop;
             else
                 compare_probe := active_probe;
             end if;

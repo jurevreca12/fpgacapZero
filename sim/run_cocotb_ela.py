@@ -114,8 +114,19 @@ TARGETS: tuple[CocotbTarget, ...] = (
         {"EXT_TRIG_EN": 1, "INPUT_PIPE": 1},
         (
             "rolling_prehistory_and_rearm",
+            "input_pipe_depth_sets_capture_latency",
             "config_written_after_arm_does_not_reach_armed_capture",
         ),
+    ),
+    CocotbTarget(
+        "input_pipe2",
+        {"EXT_TRIG_EN": 1, "INPUT_PIPE": 2},
+        ("input_pipe_depth_sets_capture_latency",),
+    ),
+    CocotbTarget(
+        "input_pipe3",
+        {"EXT_TRIG_EN": 1, "INPUT_PIPE": 3},
+        ("input_pipe_depth_sets_capture_latency",),
     ),
     CocotbTarget(
         "config_min",
