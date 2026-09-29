@@ -1130,6 +1130,40 @@ async def input_pipe_depth_sets_capture_latency(dut):
 
 
 @cocotb.test()
+async def input_pipe_keeps_the_write_queued_at_arm(dut):
+    """The input pipe is a delay, not a filter: the sample queued for the RAM
+    on the arm edge must still be written, as it is with INPUT_PIPE=0, or the
+    pre-trigger history keeps a stale word where it should have gone."""
+    ela = await setup(dut)
+    await ela.write(ADDR_PRETRIG, 10)
+    await ela.write(ADDR_POSTTRIG, 2)
+    await ela.write(ADDR_TRIG_MODE, 1)
+    await ela.write(ADDR_TRIG_VALUE, 0xFF)
+    await ela.write(ADDR_TRIG_MASK, 0xFF)
+    await ela.write(ADDR_TRIG_EXT, 1)
+    counter = cocotb.start_soon(free_running_counter(dut))
+    # pretrig_len is latched on arm, so idle prefill only builds usable history
+    # once an earlier arm has latched it: capture once, soft-reset, then let
+    # the idle core refill the pre-trigger window from before the next arm.
+    dut.trigger_in.value = 1
+    await ela.arm()
+    assert await ela.wait_done() & 0x4
+    dut.trigger_in.value = 0
+    await ela.reset_core()
+    await ela.wait_sample(30)
+    # Held across the arm so the trigger commits within a few samples of it,
+    # which puts the arm edge inside the pre-trigger window.
+    dut.trigger_in.value = 1
+    await ela.arm()
+    await ela.wait_sample(4)
+    dut.trigger_in.value = 0
+    assert await ela.wait_done() & 0x4
+    counter.cancel()
+    window = [s & 0xFF for s in await ela.read_samples(13)]
+    assert counter_steps(window) == [1] * 12, f"window has a stale word: {window}"
+
+
+@cocotb.test()
 async def config_written_after_arm_does_not_reach_armed_capture(dut):
     """Arm latches decimation and trigger mode from their synchronised copies.
     With the sample clock slower than JTAG, a write landing just after ARM is

@@ -1234,13 +1234,14 @@ module fcapz_ela #(
     // Register the RAM write command so address, data, and enable stay
     // aligned and the trigger/WEA path does not have to reach the BRAM in
     // the same cycle as trigger evaluation.
+    //
+    // A queued write always lands, arm and soft reset included.  It carries
+    // its own address, and the pointer that produced it has already advanced;
+    // cancelling it left that address holding a sample one buffer-length old,
+    // inside any pre-trigger window reaching back across the arm.  With
+    // INPUT_PIPE = 0 the same sample is written on the arm edge itself.
     always @(posedge sample_clk or posedge sample_rst) begin
         if (sample_rst) begin
-            mem_we_a_q     <= 1'b0;
-            mem_wr_addr_q  <= {PTR_W{1'b0}};
-            mem_wr_data_q  <= {SAMPLE_W{1'b0}};
-            mem_wr_ts_q    <= {TS_DATA_W{1'b0}};
-        end else if (reset_pulse || any_arm_pulse) begin
             mem_we_a_q     <= 1'b0;
             mem_wr_addr_q  <= {PTR_W{1'b0}};
             mem_wr_data_q  <= {SAMPLE_W{1'b0}};
