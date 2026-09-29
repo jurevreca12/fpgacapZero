@@ -157,6 +157,10 @@ architecture rtl of fcapz_ela is
     end function;
 
     constant PTR_W            : positive := fcapz_clog2(DEPTH);
+    -- Capture lengths are counts, not pointers, and a length may legally
+    -- equal DEPTH, so they need one bit more than an address.  Mirrors
+    -- LEN_W in rtl/fcapz_ela.v.
+    constant LEN_W            : positive := fcapz_clog2(DEPTH + 1);
     constant WORDS_PER_SAMPLE : positive := (SAMPLE_W + 31) / 32;
     constant SEG_DEPTH        : positive := DEPTH / NUM_SEGMENTS;
     constant SEG_PTR_W        : positive := fcapz_clog2(SEG_DEPTH);
@@ -257,10 +261,10 @@ architecture rtl of fcapz_ela is
     signal jtag_trig_delay   : std_logic_vector(15 downto 0) := (others => '0');
     signal jtag_trig_holdoff : std_logic_vector(15 downto 0) := (others => '0');
 
-    signal pretrig_len_sync1      : unsigned(PTR_W - 1 downto 0) := (others => '0');
-    signal pretrig_len_sync2      : unsigned(PTR_W - 1 downto 0) := (others => '0');
-    signal posttrig_len_sync1     : unsigned(PTR_W - 1 downto 0) := (others => '0');
-    signal posttrig_len_sync2     : unsigned(PTR_W - 1 downto 0) := (others => '0');
+    signal pretrig_len_sync1      : unsigned(LEN_W - 1 downto 0) := (others => '0');
+    signal pretrig_len_sync2      : unsigned(LEN_W - 1 downto 0) := (others => '0');
+    signal posttrig_len_sync1     : unsigned(LEN_W - 1 downto 0) := (others => '0');
+    signal posttrig_len_sync2     : unsigned(LEN_W - 1 downto 0) := (others => '0');
     signal trig_mode_sync1        : std_logic_vector(31 downto 0) := (others => '0');
     signal trig_mode_sync2        : std_logic_vector(31 downto 0) := (others => '0');
     -- Widened to SAMPLE_W so the full comparator-A value/mask can cross the CDC
@@ -270,8 +274,8 @@ architecture rtl of fcapz_ela is
     signal trig_value_sync2       : std_logic_vector(SAMPLE_W - 1 downto 0) := (others => '0');
     signal trig_mask_sync1        : std_logic_vector(SAMPLE_W - 1 downto 0) := (others => '0');
     signal trig_mask_sync2        : std_logic_vector(SAMPLE_W - 1 downto 0) := (others => '0');
-    signal pretrig_len            : unsigned(PTR_W - 1 downto 0) := (others => '0');
-    signal posttrig_len           : unsigned(PTR_W - 1 downto 0) := (others => '0');
+    signal pretrig_len            : unsigned(LEN_W - 1 downto 0) := (others => '0');
+    signal posttrig_len           : unsigned(LEN_W - 1 downto 0) := (others => '0');
     signal cap_trig_mode          : std_logic_vector(31 downto 0) := x"00000001";
     signal cap_trig_value         : std_logic_vector(31 downto 0) := (others => '0');
     signal cap_trig_mask          : std_logic_vector(31 downto 0) := x"FFFFFFFF";
@@ -350,7 +354,11 @@ architecture rtl of fcapz_ela is
     signal start_ptr         : natural range 0 to DEPTH - 1 := 0;
     signal trig_ptr          : natural range 0 to DEPTH - 1 := 0;
     signal pre_count         : unsigned(PTR_W downto 0) := (others => '0');
-    signal post_count        : unsigned(PTR_W - 1 downto 0) := (others => '0');
+    -- LEN_W wide, like the Verilog core's: post_count is compared against
+    -- posttrig_len, which may legally hold DEPTH, so a PTR_W counter wraps
+    -- one short and the capture never completes.  (pre_count below is
+    -- already LEN_W wide, spelled PTR_W downto 0.)
+    signal post_count        : unsigned(LEN_W - 1 downto 0) := (others => '0');
     signal capture_len       : unsigned(PTR_W downto 0) := (others => '0');
     signal probe_prev        : std_logic_vector(SAMPLE_W - 1 downto 0) := (others => '0');
     signal decim_count       : unsigned(23 downto 0) := (others => '0');
@@ -465,6 +473,20 @@ architecture rtl of fcapz_ela is
         return resize(v, PTR_W + 1);
     end function;
 
+    -- One bit wider than a length, for the overflow comparison only.  Mirrors
+    -- the Verilog core's config_capture_len, which is [LEN_W:0]: summing two
+    -- lengths and a 1 can carry out of LEN_W, and wrapping there would clear
+    -- the very overflow being tested for.
+    function len_sum_u(n : natural) return unsigned is
+    begin
+        return to_unsigned(n, LEN_W + 1);
+    end function;
+
+    function len_sum_u(v : unsigned) return unsigned is
+    begin
+        return resize(v, LEN_W + 1);
+    end function;
+
     function sample_chunk_word(sample : std_logic_vector(SAMPLE_W - 1 downto 0); chunk : natural) return std_logic_vector is
         variable r : std_logic_vector(31 downto 0) := (others => '0');
         variable bit_base : natural;
@@ -495,9 +517,11 @@ architecture rtl of fcapz_ela is
 
     function cfg_len(v : std_logic_vector(31 downto 0)) return unsigned is
     begin
-        -- Match the Verilog core: capture lengths consume only the pointer-width
+        -- Match the Verilog core: capture lengths consume only the length
         -- field, while JTAG register readback preserves the full 32-bit write.
-        return unsigned(v(PTR_W - 1 downto 0));
+        -- This is LEN_W, not PTR_W: a length may equal DEPTH, and narrowing to
+        -- PTR_W silently turned a written DEPTH into 0.
+        return unsigned(v(LEN_W - 1 downto 0));
     end function;
 
     function next_ptr(ptr : natural; base : natural) return natural is
@@ -1142,6 +1166,15 @@ begin
         datawin_oob_comb <= '0';
         datawin_mem_addr_comb <= (others => '0');
         datawin_chunk_comb <= 0;
+        -- Default the index OUT of range.  An address below ADDR_DATA_BASE
+        -- matches neither branch below, and the entry default of 0 is in range,
+        -- so such a read used to be treated as sample 0 of the window.  The
+        -- Verilog core's if/else is unconditional and its 32-bit subtract
+        -- underflows to a far out-of-range index, giving oob = 1 and
+        -- mem_addr = 0; this makes the VHDL agree.  Note the chunk index still
+        -- differs from the Verilog's underflowed value when
+        -- WORDS_PER_SAMPLE > 1; it is unused on an under-base read.
+        sample_index := integer'high;
 
         if TIMESTAMP_W > 0 and addr >= ADDR_TS_DATA_BASE then
             datawin_is_ts_comb <= '1';
@@ -1340,7 +1373,7 @@ begin
         variable base : natural;
         variable start_calc : natural;
         variable next_segment : natural;
-        variable post_limit : unsigned(PTR_W - 1 downto 0);
+        variable post_limit : unsigned(LEN_W - 1 downto 0);
         variable trigger_commit_now : boolean;
         variable force_store_now : boolean;
         variable store_now : boolean;
@@ -1542,13 +1575,26 @@ begin
                 post_count <= (others => '0');
                 trig_delay_pending <= '0';
                 trig_delay_count <= (others => '0');
+                -- Sample writes are frozen while done is held (the host is
+                -- reading the buffer out), so the rolling pre-arm history now
+                -- has a hole in it.  pre_count must stop vouching for it, or
+                -- the next arm lets a trigger commit immediately and
+                -- start_ptr reaches back across the freeze into the previous
+                -- capture -- a window spliced from two moments with nothing
+                -- marking the join.  Segmented builds already clear pre_count
+                -- on arm and on segment auto-rearm, so this is single-segment
+                -- only.  Mirrors rtl/fcapz_ela.v.
+                if NUM_SEGMENTS = 1 then
+                    pre_count <= (others => '0');
+                end if;
             end if;
 
             if any_arm_pulse_now then
                 armed <= '1';
                 triggered <= '0';
                 done <= '0';
-                overflow <= '1' when count_u(pretrig_len_sync2) + count_u(posttrig_len_sync2) + 1 > count_u(SEG_DEPTH) else '0';
+                overflow <= '1' when len_sum_u(pretrig_len_sync2) + len_sum_u(posttrig_len_sync2) + 1 >
+                                     len_sum_u(SEG_DEPTH) else '0';
                 if NUM_SEGMENTS > 1 then
                     wr_ptr <= 0;
                     pre_count <= (others => '0');
