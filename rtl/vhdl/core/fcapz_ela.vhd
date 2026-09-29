@@ -1675,8 +1675,15 @@ begin
                             trig_delay_count <= trig_delay - 1;
                         end if;
                     elsif pre_count >= count_u(pretrig_len) and trig_holdoff_active = '0' and
-                          TRIG_STAGES > 1 and comb_seq_stage_hit = '1' and seq_is_final(seq_state) = '0' then
-                        if seq_count_target(seq_state) = 0 or seq_counter + 1 >= seq_count_target(seq_state) then
+                          TRIG_STAGES > 1 and comb_seq_stage_hit = '1' then
+                        -- Mirrors seq_advance in rtl/fcapz_ela.v: a final
+                        -- stage never advances, but its hits still count, or
+                        -- a final stage with count target > 1 never triggers.
+                        -- Its terminal hit is taken by the trigger branch
+                        -- above; reaching here with the count met means the
+                        -- external-trigger combine held it back.
+                        if seq_is_final(seq_state) = '0' and
+                           (seq_count_target(seq_state) = 0 or seq_counter + 1 >= seq_count_target(seq_state)) then
                             seq_state <= to_integer(unsigned(seq_next_state(seq_state)));
                             seq_counter <= (others => '0');
                         else

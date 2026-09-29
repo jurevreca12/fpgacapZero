@@ -1088,3 +1088,20 @@ async def segmented_windows_are_contiguous(dut):
         window = [s & 0xFF for s in await ela.read_samples(4)]
         assert counter_steps(window) == [1, 1, 1], f"segment {seg} window {window}"
     FUNCTIONAL_COVERAGE.hit("segments")
+
+
+@cocotb.test()
+async def sequencer_final_stage_counts_to_target(dut):
+    """A final stage with count target 2 triggers on its second hit."""
+    ela = await setup(dut)
+    await ela.write(ADDR_PRETRIG, 0)
+    await ela.write(ADDR_POSTTRIG, 0)
+    await ela.write(ADDR_SEQ_BASE + 0, (2 << 16) | 0x1000)  # final, target 2, EQ
+    await ela.write(ADDR_SEQ_BASE + 4, 3)
+    await ela.write(ADDR_SEQ_BASE + 8, 0x03)
+    await ela.arm()
+    await ela.drive_counter(32)
+    assert await ela.wait_done() & 0x4
+    # Hits at 3 and 7; the second one is the trigger sample.
+    assert await ela.read(ADDR_DATA_BASE) & 0xFF == 7
+    FUNCTIONAL_COVERAGE.hit("sequencer")
