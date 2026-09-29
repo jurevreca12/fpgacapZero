@@ -1105,3 +1105,33 @@ async def sequencer_final_stage_counts_to_target(dut):
     # Hits at 3 and 7; the second one is the trigger sample.
     assert await ela.read(ADDR_DATA_BASE) & 0xFF == 7
     FUNCTIONAL_COVERAGE.hit("sequencer")
+
+
+@cocotb.test()
+async def config_written_after_arm_does_not_reach_armed_capture(dut):
+    """Arm latches decimation and trigger mode from their synchronised copies.
+    With the sample clock slower than JTAG, a write landing just after ARM is
+    still unsynchronised when arm takes effect and must not apply to it."""
+    ela = await setup(dut, sample_period_ns=30)
+    await ela.write(ADDR_TRIG_EXT, 0)
+    await ela.write(ADDR_DECIM, 0)
+    await ela.configure_value_capture(pre=0, post=2, value=0, mask=0)
+    dut.trigger_in.value = 0
+
+    if DECIM_EN:
+        await ela.wait_sample(4)
+        await ela.write(ADDR_CTRL, 0x1)  # ARM
+        await ela.write(ADDR_DECIM, 3)  # would store every 4th sample
+        await ela.drive_counter(20)
+        assert await ela.wait_done() & 0x4
+        window = [s & 0xFF for s in await ela.read_samples(3)]
+        assert counter_steps(window) == [1, 1], f"late decimation applied: {window}"
+        await ela.write(ADDR_DECIM, 0)
+        await ela.reset_core()
+
+    await ela.wait_sample(4)
+    await ela.write(ADDR_CTRL, 0x1)  # ARM
+    await ela.write(ADDR_TRIG_EXT, 2)  # AND with trigger_in, which stays low
+    await ela.drive_counter(20)
+    assert await ela.wait_done() & 0x4, "late external-trigger mode applied"
+    assert await ela.read(ADDR_TRIG_EXT) == 2

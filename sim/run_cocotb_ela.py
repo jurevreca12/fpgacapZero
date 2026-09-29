@@ -81,6 +81,7 @@ TARGETS: tuple[CocotbTarget, ...] = (
             "trigger_out_pulse",
             "trigger_delay_startup_and_holdoff",
             "burst_start_register",
+            "config_written_after_arm_does_not_reach_armed_capture",
         ),
     ),
     CocotbTarget("timestamp32", {"DECIM_EN": 1, "TIMESTAMP_W": 32},
@@ -111,7 +112,10 @@ TARGETS: tuple[CocotbTarget, ...] = (
     CocotbTarget(
         "rolling_prehistory",
         {"EXT_TRIG_EN": 1, "INPUT_PIPE": 1},
-        ("rolling_prehistory_and_rearm",),
+        (
+            "rolling_prehistory_and_rearm",
+            "config_written_after_arm_does_not_reach_armed_capture",
+        ),
     ),
     CocotbTarget(
         "config_min",

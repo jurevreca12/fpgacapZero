@@ -920,13 +920,16 @@ begin
                 else
                     probe_sel <= 0;
                 end if;
+                -- From the synchronisers, like every other field latched
+                -- here: jtag_decim / jtag_trig_ext belong to the JTAG clock
+                -- domain.  Mirrors rtl/fcapz_ela.v.
                 if DECIM_EN /= 0 then
-                    decim_ratio <= unsigned(jtag_decim);
+                    decim_ratio <= decim_sync2;
                 else
                     decim_ratio <= (others => '0');
                 end if;
                 if EXT_TRIG_EN /= 0 then
-                    ext_trig_mode <= jtag_trig_ext;
+                    ext_trig_mode <= trig_ext_sync2;
                 else
                     ext_trig_mode <= (others => '0');
                 end if;
