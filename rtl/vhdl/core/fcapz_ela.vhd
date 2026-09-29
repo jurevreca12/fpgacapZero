@@ -1618,10 +1618,15 @@ begin
                 sq_pipe <= '0';
             end if;
 
+            -- Idle prefill is single-segment only, as in rtl/fcapz_ela.v: a
+            -- segmented capture restarts at address 0 on arm, and this block
+            -- runs after the arm block on the arm edge (armed is still '0'),
+            -- so an unguarded wr_ptr update here would override that reset
+            -- and start segment 0 on stale pre-arm samples.
             if armed = '0' and done = '0' then
                 trig_delay_pending <= '0';
                 trig_delay_count <= (others => '0');
-                if store_ok then
+                if NUM_SEGMENTS = 1 and store_ok then
                     if pre_count < count_u(pretrig_len) then
                         pre_count <= pre_count + 1;
                     end if;

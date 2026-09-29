@@ -86,7 +86,8 @@ TARGETS: tuple[CocotbTarget, ...] = (
     CocotbTarget("timestamp32", {"DECIM_EN": 1, "TIMESTAMP_W": 32},
                  ("timestamp_capture", "timestamp_decimation_gap")),
     CocotbTarget("timestamp48", {"TIMESTAMP_W": 48}, ("timestamp_48_upper_word",)),
-    CocotbTarget("segments4", {"NUM_SEGMENTS": 4}, ("segmented_capture",)),
+    CocotbTarget("segments4", {"NUM_SEGMENTS": 4},
+                 ("segmented_capture", "segmented_windows_are_contiguous")),
     CocotbTarget("probe_mux", {"PROBE_MUX_W": 32}, ("probe_mux_slice_selection",)),
     CocotbTarget(
         "input_pipe",
