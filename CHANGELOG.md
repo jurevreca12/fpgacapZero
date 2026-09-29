@@ -70,6 +70,39 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Intel/Altera — `close()` now waits for `quartus_stp` to exit.**
+  `QuartusStpTransport.close()` signalled the process and returned at once, so
+  it could return while `quartus_stp` was still alive and still attached to the
+  USB-Blaster; a script that closed one session and opened the next raced its
+  own previous process for the cable. `close()` now runs Quartus' own
+  `close_device`, sends `exit` and closes stdin, then waits for the process to
+  exit, escalating to terminate and kill. The whole teardown is bounded, even
+  when another thread's request is stalled holding the I/O lock. Closing now
+  takes about 0.05–0.1 s where it used to return immediately. A new
+  `close_fast()` skips the wait for Ctrl+C, matching the Xilinx transport.
+
+  This was reported as a second session failing to open the cable, but that
+  failure did **not** reproduce on a DE25-Nano with Quartus Pro 26.1: there a
+  second session opens even while the first is still open, and the next
+  process spawn takes long enough to hide the race. Treat this as lifecycle
+  hardening against that class of failure, not as a confirmed fix for it.
+
+- **Intel/Altera — one session can no longer damage another.** A request that
+  timed out killed whichever process the transport held *at that moment*, so a
+  stale request could destroy the connection that had replaced its own; the
+  output-draining threads could likewise deliver a closed session's
+  end-of-stream marker into the next session and fail its first scan with
+  "process exited unexpectedly". A request arriving just after another timed
+  out could also read that request's late answer as its own. Each session is
+  now one object, built completely before it is published, and every request
+  stays bound to the session it started on; a timeout or interruption marks
+  that session dead before the next request can reach it. `connect()` on a
+  transport that is still open closes the previous session instead of leaking
+  its process, and a failed `connect()` no longer leaves `quartus_stp` running.
+  A timed-out session is now reaped — waited for and its pipes closed — rather
+  than only signalled. Cancelling a connect from the GUI no longer waits for an
+  `open_device` that keeps printing without finishing: `close()` kills it.
+
 - **ELA (native VHDL) — a capture length of `DEPTH` is no longer silently
   truncated.** The VHDL core sized `pretrig_len`/`posttrig_len` and their
   clock-crossing stages one bit narrower than the Verilog core, which sizes them
