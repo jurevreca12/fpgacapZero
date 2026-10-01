@@ -10,6 +10,8 @@ sources:
   - rtl/fcapz_eio.v
   - rtl/jtag_burst_read.v
   - rtl/jtag_reg_iface.v
+  - rtl/jtag_pipe_iface.v
+  - rtl/reset_sync.v
   - rtl/trig_compare.v
   - rtl/fcapz_regbus_mux.v
   - rtl/dpram.v
